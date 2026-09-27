@@ -5,6 +5,9 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CLIENT="${ROOT}/scnet-aichat"
 WORKER="${ROOT}/worker/scnet-aichat-worker.slurm"
+SERVER_JOB="${ROOT}/server/llama-server.slurm"
+SERVER_BUILD="${ROOT}/server/build-server.sh"
+SERVER_START="${ROOT}/server/start-server.sh"
 
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
@@ -15,7 +18,8 @@ pass() {
   printf 'PASS: %s\n' "$*"
 }
 
-/bin/bash -n "$CLIENT" "$WORKER" || fail "Bash syntax"
+/bin/bash -n "$CLIENT" "$WORKER" "$SERVER_JOB" "$SERVER_BUILD" "$SERVER_START" ||
+  fail "Bash syntax"
 pass "Bash syntax"
 
 if grep -nE 'declare[[:space:]]+-A|mapfile|readarray|date[^#]*%N|\$\{[^}]*,,|\$\{[^}]*\^\^' \
