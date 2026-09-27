@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+
+set -eu
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CLIENT="${ROOT}/scnet-aichat"
+WORKER="${ROOT}/worker/scnet-aichat-worker.slurm"
+
+fail() {
+  printf 'FAIL: %s\n' "$*" >&2
+  exit 1
+}
+
+pass() {
+  printf 'PASS: %s\n' "$*"
+}
+
+/bin/bash -n "$CLIENT" "$WORKER" || fail "Bash syntax"
+pass "Bash syntax"
+
+if grep -nE 'declare[[:space:]]+-A|mapfile|readarray|date[^#]*%N|\$\{[^}]*,,|\$\{[^}]*\^\^' \
+  "$CLIENT" "$WORKER" >/dev/null 2>&1; then
+  fail "Bash 4+ syntax detected"
+fi
+pass "Bash 3.2 compatibility scan"
+
+"$CLIENT" --help >/dev/null || fail "help command"
+pass "help command"
+
+dry14="$(SCNET_REMOTE_HOME=/remote/home "$CLIENT" --dry-run --model 14b ask test)"
+printf '%s\n' "$dry14" | grep -q 'resources=dcu:1 cpu:8 mem:27gb' ||
+  fail "14B resource mapping"
+pass "14B resource mapping"
+
+dry32="$(SCNET_REMOTE_HOME=/remote/home "$CLIENT" --dry-run --model 32b ask test)"
+printf '%s\n' "$dry32" | grep -q 'resources=dcu:4 cpu:32 mem:110gb' ||
+  fail "32B resource mapping"
+pass "32B resource mapping"
+
+set +e
+"$CLIENT" --model 72b doctor >/dev/null 2>&1
+bad_model=$?
+"$CLIENT" --max-tokens 0 --dry-run ask test >/dev/null 2>&1
+bad_tokens=$?
+set -e
+[[ $bad_model -ne 0 && $bad_tokens -ne 0 ]] || fail "invalid input rejection"
+pass "invalid input rejection"
+
+case "${SCNET_AICHAT_REMOTE_TESTS:-0}" in
+  1)
+    "$CLIENT" doctor >/dev/null || fail "remote doctor"
+    pass "remote doctor"
+    ;;
+  *) printf 'SKIP: remote doctor (set SCNET_AICHAT_REMOTE_TESTS=1)\n' ;;
+esac
+
+printf 'All tests passed.\n'

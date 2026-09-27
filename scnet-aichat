@@ -1,0 +1,456 @@
+#!/usr/bin/env bash
+
+# SCNet AI Chat: Bash 3.2 compatible Slurm-backed chat client.
+
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG_FILE="${SCNET_AICHAT_CONFIG:-${HOME}/.config/scnet-aichat/config}"
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+fi
+
+PROFILE="${SCNET_PROFILE:-kseshell}"
+PARTITION="${SCNET_PARTITION:-kshdnormal}"
+MODEL="${SCNET_MODEL:-14b}"
+MAX_TOKENS="${SCNET_MAX_TOKENS:-512}"
+POLL_SECONDS="${SCNET_POLL_SECONDS:-5}"
+SYSTEM_PROMPT="${SCNET_SYSTEM_PROMPT:-You are a helpful assistant. Answer coherently and directly.}"
+WAIT_FOR_RESULT=1
+DRY_RUN=0
+
+GCC_MODULE="${SCNET_GCC_MODULE:-compiler/gcc/11.2.0}"
+DTK_MODULE="${SCNET_DTK_MODULE:-compiler/dtk/26.04}"
+
+R14_GPUS="${SCNET_14B_GPUS:-1}"
+R14_CPUS="${SCNET_14B_CPUS:-8}"
+R14_MEM="${SCNET_14B_MEM:-27gb}"
+R14_TIME="${SCNET_14B_TIME:-02:00:00}"
+R32_GPUS="${SCNET_32B_GPUS:-4}"
+R32_CPUS="${SCNET_32B_CPUS:-32}"
+R32_MEM="${SCNET_32B_MEM:-110gb}"
+R32_TIME="${SCNET_32B_TIME:-03:00:00}"
+
+STATE_DIR="${SCNET_AICHAT_STATE_DIR:-${HOME}/.scnet-aichat}"
+JOBS_FILE="${STATE_DIR}/jobs.tsv"
+
+REMOTE_HOME="${SCNET_REMOTE_HOME:-}"
+REMOTE_APP_DIR="${SCNET_REMOTE_APP_DIR:-}"
+LLAMA_CLI="${SCNET_LLAMA_CLI:-}"
+MODEL_14B_PATH="${SCNET_MODEL_14B_PATH:-}"
+MODEL_32B_PATH="${SCNET_MODEL_32B_PATH:-}"
+
+find_worker() {
+  for candidate in \
+    "${SCNET_AICHAT_WORKER_LOCAL:-}" \
+    "${SCRIPT_DIR}/worker/scnet-aichat-worker.slurm" \
+    "${SCRIPT_DIR}/../share/scnet-aichat/scnet-aichat-worker.slurm"; do
+    if [[ -n "$candidate" && -f "$candidate" ]]; then
+      WORKER_LOCAL="$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
+  BOLD="$(tput bold 2>/dev/null || true)"
+  DIM="$(tput dim 2>/dev/null || true)"
+  GREEN="$(tput setaf 2 2>/dev/null || true)"
+  YELLOW="$(tput setaf 3 2>/dev/null || true)"
+  RED="$(tput setaf 1 2>/dev/null || true)"
+  RESET="$(tput sgr0 2>/dev/null || true)"
+else
+  BOLD=""; DIM=""; GREEN=""; YELLOW=""; RED=""; RESET=""
+fi
+
+say() { printf '%s\n' "$*"; }
+info() { printf '%s%s%s\n' "$DIM" "$*" "$RESET"; }
+ok() { printf '%s%s%s\n' "$GREEN" "$*" "$RESET"; }
+warn() { printf '%s%s%s\n' "$YELLOW" "$*" "$RESET" >&2; }
+die() { printf '%sError: %s%s\n' "$RED" "$*" "$RESET" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Usage:
+  scnet-aichat                           interactive panel
+  scnet-aichat install                   install/update remote worker
+  scnet-aichat doctor                    validate local and remote setup
+  scnet-aichat ask "question"            submit and wait
+  scnet-aichat status JOB_ID
+  scnet-aichat result JOB_ID
+  scnet-aichat cancel JOB_ID
+  scnet-aichat history
+
+Options (before the command):
+  --profile NAME
+  --partition NAME
+  --model 14b|32b
+  --max-tokens N
+  --poll-seconds N
+  --system TEXT
+  --no-wait
+  --dry-run
+EOF
+}
+
+require_tools() {
+  for tool in ssh scp awk mktemp; do
+    command -v "$tool" >/dev/null 2>&1 || die "missing local command: $tool"
+  done
+}
+
+ssh_run() {
+  LC_ALL=C LANG=C ssh -n -o BatchMode=yes "$PROFILE" "$1"
+}
+
+validate_name() {
+  value="$1"
+  label="$2"
+  case "$value" in
+    ""|*[!A-Za-z0-9._-]*) die "unsafe $label: $value" ;;
+  esac
+}
+
+validate_uint() {
+  value="$1"
+  label="$2"
+  case "$value" in
+    ""|*[!0-9]*) die "$label must be an integer" ;;
+  esac
+}
+
+validate_remote_path() {
+  value="$1"
+  label="$2"
+  case "$value" in
+    /*) ;;
+    *) die "$label must be an absolute path" ;;
+  esac
+  case "$value" in
+    *[!A-Za-z0-9_./+-]*) die "unsafe $label" ;;
+  esac
+}
+
+validate_settings() {
+  validate_name "$PROFILE" "SSH profile"
+  validate_name "$PARTITION" "partition"
+  case "$MODEL" in 14b|32b) ;; *) die "model must be 14b or 32b" ;; esac
+  validate_uint "$MAX_TOKENS" "max-tokens"
+  (( MAX_TOKENS >= 1 && MAX_TOKENS <= 4096 )) || die "max-tokens must be 1-4096"
+  validate_uint "$POLL_SECONDS" "poll-seconds"
+  (( POLL_SECONDS >= 1 && POLL_SECONDS <= 300 )) || die "poll-seconds must be 1-300"
+}
+
+resolve_remote_layout() {
+  [[ -n "$REMOTE_HOME" ]] || REMOTE_HOME="$(ssh_run 'printf %s "$HOME"')" ||
+    die "cannot discover remote HOME"
+  validate_remote_path "$REMOTE_HOME" "remote HOME"
+
+  [[ -n "$REMOTE_APP_DIR" ]] || REMOTE_APP_DIR="${REMOTE_HOME}/.scnet-aichat"
+  [[ -n "$LLAMA_CLI" ]] ||
+    LLAMA_CLI="${REMOTE_HOME}/eva-k100/llama.cpp-b5046/build-gfx906/bin/llama-cli"
+  [[ -n "$MODEL_14B_PATH" ]] ||
+    MODEL_14B_PATH="${REMOTE_HOME}/models/EVA-Qwen2.5-14B-v0.2-GGUF-Q4_0/EVA-Qwen2.5-14B-v0.2-Q4_0.gguf"
+  [[ -n "$MODEL_32B_PATH" ]] ||
+    MODEL_32B_PATH="${REMOTE_HOME}/models/EVA-Qwen2.5-32B-v0.2-GGUF/EVA-Qwen2.5-32B-v0.2-Q4_K_M.gguf"
+
+  validate_remote_path "$REMOTE_APP_DIR" "remote app dir"
+  validate_remote_path "$LLAMA_CLI" "llama-cli path"
+  validate_remote_path "$MODEL_14B_PATH" "14B model path"
+  validate_remote_path "$MODEL_32B_PATH" "32B model path"
+}
+
+init_state() {
+  mkdir -p "$STATE_DIR" || die "cannot create $STATE_DIR"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+  if [[ ! -f "$JOBS_FILE" ]]; then
+    : > "$JOBS_FILE" || die "cannot create $JOBS_FILE"
+    chmod 600 "$JOBS_FILE" 2>/dev/null || true
+  fi
+}
+
+install_worker() {
+  validate_settings
+  require_tools
+  resolve_remote_layout
+  find_worker || die "cannot find scnet-aichat-worker.slurm"
+
+  remote_worker="${REMOTE_APP_DIR}/worker.slurm"
+  remote_tmp="${remote_worker}.tmp.$$"
+  ssh_run "mkdir -p '${REMOTE_APP_DIR}/requests' && chmod 700 '$REMOTE_APP_DIR' '${REMOTE_APP_DIR}/requests'" ||
+    die "cannot create remote app directory"
+  LC_ALL=C LANG=C scp -q "$WORKER_LOCAL" "${PROFILE}:${remote_tmp}" ||
+    die "worker upload failed"
+  ssh_run "chmod 755 '$remote_tmp' && mv '$remote_tmp' '$remote_worker'" ||
+    die "worker install failed"
+  ok "Installed remote worker: $remote_worker"
+}
+
+ensure_worker() {
+  remote_worker="${REMOTE_APP_DIR}/worker.slurm"
+  if ! ssh_run "test -x '$remote_worker'" >/dev/null 2>&1; then
+    warn "Remote worker is missing; installing it now."
+    install_worker
+  fi
+}
+
+set_resources() {
+  case "$MODEL" in
+    14b)
+      JOB_GPUS="$R14_GPUS"; JOB_CPUS="$R14_CPUS"; JOB_MEM="$R14_MEM"; JOB_TIME="$R14_TIME"
+      MODEL_PATH="$MODEL_14B_PATH"
+      ;;
+    32b)
+      JOB_GPUS="$R32_GPUS"; JOB_CPUS="$R32_CPUS"; JOB_MEM="$R32_MEM"; JOB_TIME="$R32_TIME"
+      MODEL_PATH="$MODEL_32B_PATH"
+      ;;
+  esac
+  validate_uint "$JOB_GPUS" "GPU count"
+  validate_uint "$JOB_CPUS" "CPU count"
+}
+
+record_job() {
+  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$(date '+%Y-%m-%dT%H:%M:%S%z')" >> "$JOBS_FILE"
+}
+
+lookup_request() {
+  awk -F '	' -v id="$1" '$1 == id { value = $2 } END { print value }' "$JOBS_FILE"
+}
+
+job_state() {
+  line="$(ssh_run "sacct -j '$1' --format=State,ExitCode -n -P | head -n 1" 2>/dev/null || true)"
+  state="${line%%|*}"
+  state="$(printf '%s' "$state" | tr -d '[:space:]')"
+  if [[ -z "$state" ]]; then
+    state="$(ssh_run "squeue -h -j '$1' -o '%T' | head -n 1" 2>/dev/null || true)"
+    state="$(printf '%s' "$state" | tr -d '[:space:]')"
+  fi
+  printf '%s\n' "$state"
+}
+
+submit_prompt() {
+  prompt="$1"
+  validate_settings
+  require_tools
+  resolve_remote_layout
+  set_resources
+
+  request_id="$(date '+%Y%m%dT%H%M%S')-$$-${RANDOM}"
+  request_dir="${REMOTE_APP_DIR}/requests/${request_id}"
+  remote_worker="${REMOTE_APP_DIR}/worker.slurm"
+
+  submit_cmd="sbatch --parsable --partition=${PARTITION}"
+  submit_cmd="$submit_cmd --gres=dcu:${JOB_GPUS} --cpus-per-task=${JOB_CPUS}"
+  submit_cmd="$submit_cmd --mem=${JOB_MEM} --time=${JOB_TIME}"
+  submit_cmd="$submit_cmd --job-name=scnet-aichat-${MODEL}"
+  submit_cmd="$submit_cmd --output=${request_dir}/slurm-%j.out"
+  submit_cmd="$submit_cmd --error=${request_dir}/slurm-%j.err"
+  submit_cmd="$submit_cmd --export=ALL,LC_ALL=C,LANG=C,LANGUAGE=C"
+  submit_cmd="$submit_cmd,EVA_REQUEST_DIR=${request_dir},EVA_MODEL_KEY=${MODEL}"
+  submit_cmd="$submit_cmd,SCNET_GCC_MODULE=${GCC_MODULE},SCNET_DTK_MODULE=${DTK_MODULE}"
+  submit_cmd="$submit_cmd ${remote_worker}"
+
+  if (( DRY_RUN == 1 )); then
+    say "model=$MODEL"
+    say "model_path=$MODEL_PATH"
+    say "llama_cli=$LLAMA_CLI"
+    say "resources=dcu:${JOB_GPUS} cpu:${JOB_CPUS} mem:${JOB_MEM} time:${JOB_TIME}"
+    say "$submit_cmd"
+    return 0
+  fi
+
+  init_state
+  ensure_worker
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/scnet-aichat.XXXXXX")" ||
+    die "cannot create temporary directory"
+  printf '%s\n' "$prompt" > "${tmp_dir}/prompt.txt"
+  printf '%s\n' "$SYSTEM_PROMPT" > "${tmp_dir}/system.txt"
+  printf '%s\n' "$MAX_TOKENS" > "${tmp_dir}/max_tokens"
+  printf '%s\n' "$LLAMA_CLI" > "${tmp_dir}/llama_cli"
+  printf '%s\n' "$MODEL_PATH" > "${tmp_dir}/model_path"
+
+  ssh_run "mkdir -p '$request_dir' && chmod 700 '$request_dir'" || {
+    rm -rf "$tmp_dir"
+    die "cannot create remote request directory"
+  }
+  LC_ALL=C LANG=C scp -q \
+    "${tmp_dir}/prompt.txt" "${tmp_dir}/system.txt" "${tmp_dir}/max_tokens" \
+    "${tmp_dir}/llama_cli" "${tmp_dir}/model_path" \
+    "${PROFILE}:${request_dir}/" || {
+      rm -rf "$tmp_dir"
+      die "request upload failed"
+    }
+  rm -rf "$tmp_dir"
+
+  output="$(ssh_run "$submit_cmd")" || die "sbatch failed"
+  job_id="${output%%;*}"
+  case "$job_id" in ""|*[!0-9]*) die "cannot parse job id: $output" ;; esac
+  record_job "$job_id" "$request_dir" "$MODEL"
+  ok "Submitted job=$job_id model=$MODEL dcu=$JOB_GPUS cpu=$JOB_CPUS mem=$JOB_MEM"
+
+  if (( WAIT_FOR_RESULT == 1 )); then
+    wait_for_job "$job_id"
+  else
+    say "Run later: $0 result $job_id"
+  fi
+}
+
+show_status() {
+  case "$1" in ""|*[!0-9]*) die "JOB_ID must be numeric" ;; esac
+  ssh_run "sacct -j '$1' --format=JobID,JobName,Partition,State,ExitCode,Elapsed,AllocTRES -P"
+}
+
+show_result() {
+  case "$1" in ""|*[!0-9]*) die "JOB_ID must be numeric" ;; esac
+  init_state
+  request_dir="$(lookup_request "$1")"
+  [[ -n "$request_dir" ]] || die "job $1 is not in the local history"
+  state_now="$(job_state "$1")"
+  info "job=$1 state=${state_now:-UNKNOWN}"
+
+  if ssh_run "test -f '${request_dir}/answer.txt'" >/dev/null 2>&1; then
+    printf '\n%sAnswer%s\n\n' "$BOLD" "$RESET"
+    ssh_run "cat '${request_dir}/answer.txt'"
+    printf '\n'
+  else
+    warn "answer is not available yet"
+  fi
+
+  printf '%sPerformance%s\n' "$BOLD" "$RESET"
+  ssh_run "grep -aE 'load time|prompt eval time|eval time|total time' '${request_dir}/slurm-$1.err' 2>/dev/null | tail -n 5" ||
+    true
+  if [[ "$state_now" != "COMPLETED" ]]; then
+    printf '\n%sError log tail%s\n' "$BOLD" "$RESET"
+    ssh_run "tail -n 30 '${request_dir}/slurm-$1.err' 2>/dev/null" || true
+  fi
+}
+
+wait_for_job() {
+  last=""
+  while :; do
+    current="$(job_state "$1")"
+    if [[ "$current" != "$last" ]]; then
+      info "job=$1 state=${current:-WAITING_FOR_ACCOUNTING}"
+      last="$current"
+    fi
+    case "$current" in
+      COMPLETED) show_result "$1"; return 0 ;;
+      FAILED|CANCELLED|CANCELLED+|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|PREEMPTED)
+        show_result "$1"; return 1 ;;
+    esac
+    sleep "$POLL_SECONDS"
+  done
+}
+
+cancel_job() {
+  case "$1" in ""|*[!0-9]*) die "JOB_ID must be numeric" ;; esac
+  ssh_run "scancel '$1'" || die "scancel failed"
+  ok "Cancellation requested for job $1"
+}
+
+show_history() {
+  init_state
+  printf 'JOB_ID\tREQUEST_DIR\tMODEL\tSUBMITTED_AT\n'
+  tail -n 30 "$JOBS_FILE"
+}
+
+doctor() {
+  validate_settings
+  require_tools
+  resolve_remote_layout
+  ok "Local prerequisites are available; Bash ${BASH_VERSION}"
+  ssh_run "test -x '${REMOTE_APP_DIR}/worker.slurm' && echo worker=ok || echo worker=missing; test -x '$LLAMA_CLI' && echo llama_cli=ok || echo llama_cli=missing; stat -c 'model_14b=%s' '$MODEL_14B_PATH'; stat -c 'model_32b=%s' '$MODEL_32B_PATH'; sinfo -p '$PARTITION' -h -o 'partition=%P state=%a nodes=%D' | head -n 1"
+}
+
+panel_help() {
+  cat <<'EOF'
+Enter a question to submit a Slurm job.
+
+Commands:
+  /model 14b|32b
+  /tokens N
+  /system TEXT
+  /file PATH
+  /status JOB_ID
+  /result JOB_ID
+  /cancel JOB_ID
+  /history
+  /doctor
+  /install
+  /help
+  /quit
+EOF
+}
+
+interactive_panel() {
+  validate_settings
+  require_tools
+  resolve_remote_layout
+  init_state
+  ensure_worker
+  printf '%sSCNet AI Chat%s\n' "$BOLD" "$RESET"
+  say "Each question is executed as a Slurm job on $PARTITION."
+  panel_help
+
+  while :; do
+    printf '\n%s[%s tokens=%s]%s > ' "$BOLD" "$MODEL" "$MAX_TOKENS" "$RESET"
+    IFS= read -r line || break
+    [[ -n "$line" ]] || continue
+    cmd="${line%% *}"
+    arg="${line#"$cmd"}"
+    arg="${arg# }"
+    case "$cmd" in
+      /quit|/exit) break ;;
+      /help) panel_help ;;
+      /model)
+        case "$arg" in 14b|32b) MODEL="$arg"; ok "model=$MODEL" ;; *) warn "usage: /model 14b|32b" ;; esac
+        ;;
+      /tokens)
+        case "$arg" in ""|*[!0-9]*) warn "usage: /tokens 1-4096"; continue ;; esac
+        if (( arg < 1 || arg > 4096 )); then warn "usage: /tokens 1-4096"; continue; fi
+        MAX_TOKENS="$arg"; ok "max_tokens=$MAX_TOKENS"
+        ;;
+      /system) if [[ -n "$arg" ]]; then SYSTEM_PROMPT="$arg"; ok "system prompt updated"; else say "$SYSTEM_PROMPT"; fi ;;
+      /file) if [[ -f "$arg" ]]; then submit_prompt "$(cat "$arg")"; else warn "file not found: $arg"; fi ;;
+      /status) show_status "$arg" ;;
+      /result) show_result "$arg" ;;
+      /cancel) cancel_job "$arg" ;;
+      /history) show_history ;;
+      /doctor) doctor ;;
+      /install) install_worker ;;
+      /*) warn "unknown command: $cmd" ;;
+      *) submit_prompt "$line" ;;
+    esac
+  done
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --profile) [[ $# -ge 2 ]] || die "--profile needs a value"; PROFILE="$2"; shift 2 ;;
+    --partition) [[ $# -ge 2 ]] || die "--partition needs a value"; PARTITION="$2"; shift 2 ;;
+    --model) [[ $# -ge 2 ]] || die "--model needs a value"; MODEL="$2"; shift 2 ;;
+    --max-tokens) [[ $# -ge 2 ]] || die "--max-tokens needs a value"; MAX_TOKENS="$2"; shift 2 ;;
+    --poll-seconds) [[ $# -ge 2 ]] || die "--poll-seconds needs a value"; POLL_SECONDS="$2"; shift 2 ;;
+    --system) [[ $# -ge 2 ]] || die "--system needs a value"; SYSTEM_PROMPT="$2"; shift 2 ;;
+    --no-wait) WAIT_FOR_RESULT=0; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) break ;;
+  esac
+done
+
+command="${1:-panel}"
+[[ $# -eq 0 ]] || shift
+case "$command" in
+  panel) interactive_panel ;;
+  install) install_worker ;;
+  doctor) doctor ;;
+  ask) [[ $# -gt 0 ]] || die "ask needs a question"; submit_prompt "$*" ;;
+  status) [[ $# -eq 1 ]] || die "status needs JOB_ID"; show_status "$1" ;;
+  result) [[ $# -eq 1 ]] || die "result needs JOB_ID"; show_result "$1" ;;
+  cancel) [[ $# -eq 1 ]] || die "cancel needs JOB_ID"; cancel_job "$1" ;;
+  history) show_history ;;
+  *) usage; die "unknown command: $command" ;;
+esac
