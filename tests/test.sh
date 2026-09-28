@@ -41,6 +41,11 @@ printf '%s\n' "$dry32" | grep -q 'resources=dcu:4 cpu:32 mem:110gb' ||
   fail "32B resource mapping"
 pass "32B resource mapping"
 
+dry_server="$(SCNET_REMOTE_HOME=/remote/home "$CLIENT" --dry-run --mode server --model 14b ask test)"
+printf '%s\n' "$dry_server" | grep -q 'persistent_model=14b' ||
+  fail "persistent server mode"
+pass "persistent server mode"
+
 set +e
 "$CLIENT" --model 72b doctor >/dev/null 2>&1
 bad_model=$?

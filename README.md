@@ -74,6 +74,11 @@ ${EDITOR:-vi} ~/.config/scnet-aichat/config
 ```text
 /model 14b
 /model 32b
+/mode job
+/mode server
+/serve start
+/serve status
+/serve stop
 /tokens 1024
 /system You are a concise assistant.
 /file prompt.txt
@@ -91,11 +96,56 @@ ${EDITOR:-vi} ~/.config/scnet-aichat/config
 ```bash
 ./scnet-aichat ask "请解释张量并行。"
 ./scnet-aichat --model 32b --max-tokens 256 ask "写一个简短示例。"
+./scnet-aichat --mode server --model 14b ask "连续问答的第一问。"
 ./scnet-aichat --no-wait ask "生成报告。"
 ./scnet-aichat result JOB_ID
 ```
 
 每次提交都会返回 `JOB_ID`。本地历史保存在 `~/.scnet-aichat/jobs.tsv`。
+
+### 在面板里使用持久模式
+
+不需要手工执行 `sbatch`。直接启动：
+
+```bash
+./scnet-aichat
+```
+
+然后输入：
+
+```text
+/mode server
+```
+
+下一条普通问题会自动：
+
+1. 提交持久 `llama-server` 作业；
+2. 等待模型加载完成和 `/health` 就绪；
+3. 通过 `srun --jobid ... --overlap` 发送问答；
+4. 返回回答内容。
+
+之后连续输入的问题都复用同一个服务。管理命令：
+
+```text
+/serve status
+/serve stop
+```
+
+也可以直接从命令行完成第一次问答：
+
+```bash
+./scnet-aichat --mode server --model 14b ask "第一问"
+```
+
+切换模型前先停止旧服务：
+
+```text
+/serve stop
+/model 32b
+/mode server
+```
+
+如果 14B 服务正在运行，面板会拒绝直接切换到 32B，避免错误复用显存和模型。
 
 ## 二、配置
 

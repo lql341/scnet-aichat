@@ -14,6 +14,7 @@ fi
 PROFILE="${SCNET_PROFILE:-kseshell}"
 PARTITION="${SCNET_PARTITION:-kshdnormal}"
 MODEL="${SCNET_MODEL:-14b}"
+MODE="${SCNET_MODE:-job}"
 MAX_TOKENS="${SCNET_MAX_TOKENS:-512}"
 POLL_SECONDS="${SCNET_POLL_SECONDS:-5}"
 SYSTEM_PROMPT="${SCNET_SYSTEM_PROMPT:-You are a helpful assistant. Answer coherently and directly.}"
@@ -40,6 +41,8 @@ REMOTE_APP_DIR="${SCNET_REMOTE_APP_DIR:-}"
 LLAMA_CLI="${SCNET_LLAMA_CLI:-}"
 MODEL_14B_PATH="${SCNET_MODEL_14B_PATH:-}"
 MODEL_32B_PATH="${SCNET_MODEL_32B_PATH:-}"
+LLAMA_SERVER="${SCNET_LLAMA_SERVER:-}"
+SERVER_PORT="${SCNET_SERVER_PORT:-18080}"
 
 find_worker() {
   for candidate in \
@@ -48,6 +51,18 @@ find_worker() {
     "${SCRIPT_DIR}/../share/scnet-aichat/scnet-aichat-worker.slurm"; do
     if [[ -n "$candidate" && -f "$candidate" ]]; then
       WORKER_LOCAL="$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+find_server_script() {
+  for candidate in \
+    "${SCRIPT_DIR}/server/llama-server.slurm" \
+    "${SCRIPT_DIR}/../share/scnet-aichat/server/llama-server.slurm"; do
+    if [[ -f "$candidate" ]]; then
+      SERVER_SCRIPT_LOCAL="$candidate"
       return 0
     fi
   done
@@ -87,6 +102,7 @@ Options (before the command):
   --profile NAME
   --partition NAME
   --model 14b|32b
+  --mode job|server
   --max-tokens N
   --poll-seconds N
   --system TEXT
@@ -137,6 +153,7 @@ validate_settings() {
   validate_name "$PROFILE" "SSH profile"
   validate_name "$PARTITION" "partition"
   case "$MODEL" in 14b|32b) ;; *) die "model must be 14b or 32b" ;; esac
+  case "$MODE" in job|server) ;; *) die "mode must be job or server" ;; esac
   validate_uint "$MAX_TOKENS" "max-tokens"
   (( MAX_TOKENS >= 1 && MAX_TOKENS <= 4096 )) || die "max-tokens must be 1-4096"
   validate_uint "$POLL_SECONDS" "poll-seconds"
@@ -155,11 +172,16 @@ resolve_remote_layout() {
     MODEL_14B_PATH="${REMOTE_HOME}/models/EVA-Qwen2.5-14B-v0.2-GGUF-Q4_0/EVA-Qwen2.5-14B-v0.2-Q4_0.gguf"
   [[ -n "$MODEL_32B_PATH" ]] ||
     MODEL_32B_PATH="${REMOTE_HOME}/models/EVA-Qwen2.5-32B-v0.2-GGUF/EVA-Qwen2.5-32B-v0.2-Q4_K_M.gguf"
+  [[ -n "$LLAMA_SERVER" ]] ||
+    LLAMA_SERVER="${REMOTE_HOME}/eva-k100/llama.cpp-b5046/build-gfx906/bin/llama-server"
 
   validate_remote_path "$REMOTE_APP_DIR" "remote app dir"
   validate_remote_path "$LLAMA_CLI" "llama-cli path"
   validate_remote_path "$MODEL_14B_PATH" "14B model path"
   validate_remote_path "$MODEL_32B_PATH" "32B model path"
+  validate_remote_path "$LLAMA_SERVER" "llama-server path"
+  validate_uint "$SERVER_PORT" "server port"
+  (( SERVER_PORT >= 1024 && SERVER_PORT <= 65535 )) || die "server port must be 1024-65535"
 }
 
 init_state() {
@@ -176,22 +198,32 @@ install_worker() {
   require_tools
   resolve_remote_layout
   find_worker || die "cannot find scnet-aichat-worker.slurm"
+  find_server_script || die "cannot find server/llama-server.slurm"
 
   remote_worker="${REMOTE_APP_DIR}/worker.slurm"
   remote_tmp="${remote_worker}.tmp.$$"
-  ssh_run "mkdir -p '${REMOTE_APP_DIR}/requests' && chmod 700 '$REMOTE_APP_DIR' '${REMOTE_APP_DIR}/requests'" ||
+  remote_server="${REMOTE_APP_DIR}/server/llama-server.slurm"
+  remote_server_tmp="${remote_server}.tmp.$$"
+  ssh_run "mkdir -p '${REMOTE_APP_DIR}/requests' '${REMOTE_APP_DIR}/server' && chmod 700 '$REMOTE_APP_DIR' '${REMOTE_APP_DIR}/requests' '${REMOTE_APP_DIR}/server'" ||
     die "cannot create remote app directory"
   LC_ALL=C LANG=C scp -q "$WORKER_LOCAL" "${PROFILE}:${remote_tmp}" ||
     die "worker upload failed"
   ssh_run "chmod 755 '$remote_tmp' && mv '$remote_tmp' '$remote_worker'" ||
     die "worker install failed"
-  ok "Installed remote worker: $remote_worker"
+  LC_ALL=C LANG=C scp -q "$SERVER_SCRIPT_LOCAL" "${PROFILE}:${remote_server_tmp}" ||
+    die "server script upload failed"
+  ssh_run "chmod 755 '$remote_server_tmp' && mv '$remote_server_tmp' '$remote_server'" ||
+    die "server script install failed"
+  ok "Installed worker and server script"
 }
 
 ensure_worker() {
   remote_worker="${REMOTE_APP_DIR}/worker.slurm"
   if ! ssh_run "test -x '$remote_worker'" >/dev/null 2>&1; then
     warn "Remote worker is missing; installing it now."
+    install_worker
+  fi
+  if ! ssh_run "test -x '${REMOTE_APP_DIR}/server/llama-server.slurm'" >/dev/null 2>&1; then
     install_worker
   fi
 }
@@ -297,6 +329,144 @@ submit_prompt() {
   fi
 }
 
+server_job_id() {
+  ssh_run "cat '${REMOTE_APP_DIR}/server/job_id' 2>/dev/null" | tr -d '[:space:]'
+}
+
+server_start() {
+  validate_settings
+  require_tools
+  resolve_remote_layout
+  set_resources
+
+  server_cmd="sbatch --parsable --partition=${PARTITION}"
+  server_cmd="$server_cmd --gres=dcu:${JOB_GPUS} --cpus-per-task=${JOB_CPUS}"
+  server_cmd="$server_cmd --mem=${JOB_MEM} --time=${JOB_TIME}"
+  server_cmd="$server_cmd --job-name=scnet-server-${MODEL}"
+  server_cmd="$server_cmd --output=${REMOTE_APP_DIR}/server/slurm-%j.out"
+  server_cmd="$server_cmd --error=${REMOTE_APP_DIR}/server/slurm-%j.err"
+  server_cmd="$server_cmd --export=ALL,LC_ALL=C,LANG=C,LANGUAGE=C"
+  server_cmd="$server_cmd,SCNET_SERVER_APP_DIR=${REMOTE_APP_DIR}"
+  server_cmd="$server_cmd,SCNET_SERVER_MODEL=${MODEL_PATH}"
+  server_cmd="$server_cmd,SCNET_LLAMA_SERVER=${LLAMA_SERVER}"
+  server_cmd="$server_cmd,SCNET_SERVER_PORT=${SERVER_PORT}"
+  server_cmd="$server_cmd ${REMOTE_APP_DIR}/server/llama-server.slurm"
+
+  if (( DRY_RUN == 1 )); then
+    say "persistent_model=$MODEL"
+    say "persistent_binary=$LLAMA_SERVER"
+    say "persistent_port=$SERVER_PORT"
+    say "resources=dcu:${JOB_GPUS} cpu:${JOB_CPUS} mem:${JOB_MEM} time:${JOB_TIME}"
+    say "$server_cmd"
+    return 0
+  fi
+
+  existing="$(server_job_id || true)"
+  if [[ "$existing" =~ ^[0-9]+$ ]]; then
+    existing_state="$(job_state "$existing")"
+    if [[ "$existing_state" == "RUNNING" || "$existing_state" == "PENDING" ]]; then
+      active_model="$(ssh_run "cat '${REMOTE_APP_DIR}/server/model' 2>/dev/null" || true)"
+      if [[ -n "$active_model" && "$active_model" != "$MODEL_PATH" ]]; then
+        die "persistent server is running a different model; run /serve stop first"
+      fi
+      ok "Persistent server already active: job=$existing model=$MODEL"
+      return 0
+    fi
+  fi
+
+  init_state
+  ensure_worker
+  output="$(ssh_run "$server_cmd")" || die "persistent server sbatch failed"
+  job_id="${output%%;*}"
+  case "$job_id" in ""|*[!0-9]*) die "cannot parse server job id: $output" ;; esac
+  ok "Started persistent server job=$job_id model=$MODEL"
+  last=""
+  while :; do
+    state="$(job_state "$job_id")"
+    if [[ "$state" != "$last" ]]; then
+      info "server job=$job_id state=${state:-WAITING}"
+      last="$state"
+    fi
+    case "$state" in
+      FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL)
+        die "persistent server failed; inspect ${REMOTE_APP_DIR}/server/slurm-${job_id}.err"
+        ;;
+    esac
+    if ssh_run "srun --jobid='$job_id' --overlap curl -fsS --max-time 3 http://127.0.0.1:${SERVER_PORT}/health" >/dev/null 2>&1; then
+      ok "Persistent server is ready on port $SERVER_PORT"
+      return 0
+    fi
+    sleep "$POLL_SECONDS"
+  done
+}
+
+server_stop() {
+  validate_settings
+  require_tools
+  resolve_remote_layout
+  job_id="$(server_job_id || true)"
+  case "$job_id" in
+    ""|*[!0-9]*) warn "No persistent server job found"; return 0 ;;
+  esac
+  ssh_run "scancel '$job_id'" || die "persistent server scancel failed"
+  ssh_run "rm -f '${REMOTE_APP_DIR}/server/job_id'" || true
+  ok "Stopped persistent server job=$job_id"
+}
+
+server_status() {
+  validate_settings
+  require_tools
+  resolve_remote_layout
+  job_id="$(server_job_id || true)"
+  case "$job_id" in
+    ""|*[!0-9]*) warn "No persistent server job found"; return 0 ;;
+  esac
+  show_status "$job_id"
+}
+
+json_quote() {
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'
+  elif command -v perl >/dev/null 2>&1; then
+    printf '%s' "$1" | perl -0pe 's/\\/\\\\/g; s/"/\\"/g; s/\r/\\r/g; s/\n/\\n/g; s/\t/\\t/g; $_ = "\"" . $_ . "\"";'
+  else
+    die "server mode requires python3 or perl for JSON encoding"
+  fi
+}
+
+server_prompt() {
+  prompt="$1"
+  validate_settings
+  require_tools
+  resolve_remote_layout
+  if (( DRY_RUN == 1 )); then
+    server_start
+    return 0
+  fi
+  server_start
+  job_id="$(server_job_id)"
+  request_file="$(mktemp "${TMPDIR:-/tmp}/scnet-aichat-server.XXXXXX")" ||
+    die "cannot create server request file"
+  system_json="$(json_quote "$SYSTEM_PROMPT")"
+  prompt_json="$(json_quote "$prompt")"
+  printf '{"messages":[{"role":"system","content":%s},{"role":"user","content":%s}],"max_tokens":%s,"temperature":0.7,"top_p":0.9}\n' \
+    "$system_json" "$prompt_json" "$MAX_TOKENS" > "$request_file"
+  remote_request="${REMOTE_APP_DIR}/server/request-$$-${RANDOM}.json"
+  LC_ALL=C LANG=C scp -q "$request_file" "${PROFILE}:${remote_request}" || {
+    rm -f "$request_file"
+    die "server request upload failed"
+  }
+  rm -f "$request_file"
+  response="$(ssh_run "srun --jobid='$job_id' --overlap curl -fsS --max-time 600 http://127.0.0.1:${SERVER_PORT}/v1/chat/completions -H 'Content-Type: application/json' --data-binary '@${remote_request}'; rc=\$?; rm -f '${remote_request}'; exit \$rc")" ||
+    die "persistent server request failed"
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' "$response" | python3 -c 'import json,sys; x=json.load(sys.stdin); print(x["choices"][0]["message"]["content"])' 2>/dev/null ||
+      printf '%s\n' "$response"
+  else
+    printf '%s\n' "$response"
+  fi
+}
+
 show_status() {
   case "$1" in ""|*[!0-9]*) die "JOB_ID must be numeric" ;; esac
   ssh_run "sacct -j '$1' --format=JobID,JobName,Partition,State,ExitCode,Elapsed,AllocTRES -P"
@@ -361,7 +531,7 @@ doctor() {
   require_tools
   resolve_remote_layout
   ok "Local prerequisites are available; Bash ${BASH_VERSION}"
-  ssh_run "test -x '${REMOTE_APP_DIR}/worker.slurm' && echo worker=ok || echo worker=missing; test -x '$LLAMA_CLI' && echo llama_cli=ok || echo llama_cli=missing; stat -c 'model_14b=%s' '$MODEL_14B_PATH'; stat -c 'model_32b=%s' '$MODEL_32B_PATH'; sinfo -p '$PARTITION' -h -o 'partition=%P state=%a nodes=%D' | head -n 1"
+  ssh_run "test -x '${REMOTE_APP_DIR}/worker.slurm' && echo worker=ok || echo worker=missing; test -x '${REMOTE_APP_DIR}/server/llama-server.slurm' && echo server_script=ok || echo server_script=missing; test -x '$LLAMA_CLI' && echo llama_cli=ok || echo llama_cli=missing; test -x '$LLAMA_SERVER' && echo llama_server=ok || echo llama_server=missing; stat -c 'model_14b=%s' '$MODEL_14B_PATH'; stat -c 'model_32b=%s' '$MODEL_32B_PATH'; sinfo -p '$PARTITION' -h -o 'partition=%P state=%a nodes=%D' | head -n 1"
 }
 
 panel_help() {
@@ -369,6 +539,10 @@ panel_help() {
 Enter a question to submit a Slurm job.
 
 Commands:
+  /mode job|server
+  /serve start
+  /serve status
+  /serve stop
   /model 14b|32b
   /tokens N
   /system TEXT
@@ -391,7 +565,7 @@ interactive_panel() {
   init_state
   ensure_worker
   printf '%sSCNet AI Chat%s\n' "$BOLD" "$RESET"
-  say "Each question is executed as a Slurm job on $PARTITION."
+  say "Mode=$MODE; questions run on $PARTITION."
   panel_help
 
   while :; do
@@ -407,6 +581,21 @@ interactive_panel() {
       /model)
         case "$arg" in 14b|32b) MODEL="$arg"; ok "model=$MODEL" ;; *) warn "usage: /model 14b|32b" ;; esac
         ;;
+      /mode)
+        case "$arg" in
+          job) MODE=job; ok "mode=job" ;;
+          server) MODE=server; server_start ;;
+          *) warn "usage: /mode job|server" ;;
+        esac
+        ;;
+      /serve)
+        case "$arg" in
+          start) server_start ;;
+          status) server_status ;;
+          stop) server_stop ;;
+          *) warn "usage: /serve start|status|stop" ;;
+        esac
+        ;;
       /tokens)
         case "$arg" in ""|*[!0-9]*) warn "usage: /tokens 1-4096"; continue ;; esac
         if (( arg < 1 || arg > 4096 )); then warn "usage: /tokens 1-4096"; continue; fi
@@ -421,7 +610,13 @@ interactive_panel() {
       /doctor) doctor ;;
       /install) install_worker ;;
       /*) warn "unknown command: $cmd" ;;
-      *) submit_prompt "$line" ;;
+      *)
+        if [[ "$MODE" == "server" ]]; then
+          server_prompt "$line"
+        else
+          submit_prompt "$line"
+        fi
+        ;;
     esac
   done
 }
@@ -431,6 +626,7 @@ while [[ $# -gt 0 ]]; do
     --profile) [[ $# -ge 2 ]] || die "--profile needs a value"; PROFILE="$2"; shift 2 ;;
     --partition) [[ $# -ge 2 ]] || die "--partition needs a value"; PARTITION="$2"; shift 2 ;;
     --model) [[ $# -ge 2 ]] || die "--model needs a value"; MODEL="$2"; shift 2 ;;
+    --mode) [[ $# -ge 2 ]] || die "--mode needs a value"; MODE="$2"; shift 2 ;;
     --max-tokens) [[ $# -ge 2 ]] || die "--max-tokens needs a value"; MAX_TOKENS="$2"; shift 2 ;;
     --poll-seconds) [[ $# -ge 2 ]] || die "--poll-seconds needs a value"; POLL_SECONDS="$2"; shift 2 ;;
     --system) [[ $# -ge 2 ]] || die "--system needs a value"; SYSTEM_PROMPT="$2"; shift 2 ;;
@@ -447,7 +643,7 @@ case "$command" in
   panel) interactive_panel ;;
   install) install_worker ;;
   doctor) doctor ;;
-  ask) [[ $# -gt 0 ]] || die "ask needs a question"; submit_prompt "$*" ;;
+  ask) [[ $# -gt 0 ]] || die "ask needs a question"; if [[ "$MODE" == "server" ]]; then server_prompt "$*"; else submit_prompt "$*"; fi ;;
   status) [[ $# -eq 1 ]] || die "status needs JOB_ID"; show_status "$1" ;;
   result) [[ $# -eq 1 ]] || die "result needs JOB_ID"; show_result "$1" ;;
   cancel) [[ $# -eq 1 ]] || die "cancel needs JOB_ID"; cancel_job "$1" ;;
