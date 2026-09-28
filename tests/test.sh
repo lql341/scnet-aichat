@@ -46,6 +46,10 @@ printf '%s\n' "$dry_server" | grep -q 'persistent_model=14b' ||
   fail "persistent server mode"
 pass "persistent server mode"
 
+SCNET_REMOTE_HOME=/remote/home "$CLIENT" --dry-run --preset eva-rp ask test >/dev/null ||
+  fail "EVA roleplay preset"
+pass "EVA roleplay preset"
+
 set +e
 "$CLIENT" --model 72b doctor >/dev/null 2>&1
 bad_model=$?

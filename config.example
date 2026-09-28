@@ -19,9 +19,11 @@ SCNET_DTK_MODULE=compiler/dtk/26.04
 
 SCNET_MODEL=14b
 SCNET_MODE=job
+SCNET_PRESET=default
 SCNET_MAX_TOKENS=512
 SCNET_POLL_SECONDS=5
-SCNET_SYSTEM_PROMPT="You are a helpful assistant. Answer coherently and directly."
+# Setting SCNET_SYSTEM_PROMPT overrides SCNET_PRESET and selects preset=custom.
+# SCNET_SYSTEM_PROMPT="You are a helpful assistant. Answer coherently and directly."
 
 # Persistent server settings. /mode server or --mode server starts it on demand.
 # SCNET_LLAMA_SERVER=/public/home/your-user/eva-k100/llama.cpp-b5046/build-gfx906/bin/llama-server

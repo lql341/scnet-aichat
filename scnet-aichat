@@ -17,7 +17,19 @@ MODEL="${SCNET_MODEL:-14b}"
 MODE="${SCNET_MODE:-job}"
 MAX_TOKENS="${SCNET_MAX_TOKENS:-512}"
 POLL_SECONDS="${SCNET_POLL_SECONDS:-5}"
-SYSTEM_PROMPT="${SCNET_SYSTEM_PROMPT:-You are a helpful assistant. Answer coherently and directly.}"
+PRESET="${SCNET_PRESET:-default}"
+DEFAULT_SYSTEM_PROMPT="You are a helpful assistant. Answer coherently and directly."
+EVA_RP_SYSTEM_PROMPT="You are an immersive fictional roleplay assistant. Follow the character card and established setting precisely. Stay in character, preserve personality, relationships, emotional continuity, memories, and scene details across replies. Write vivid dialogue, actions, atmosphere, and sensory detail without summarizing the scene or speaking for the user. Let the user control their own character. Mature fictional themes may be explored only when every participant is explicitly an adult and all intimate activity is consensual. Never involve minors or ambiguous ages."
+if [[ -n "${SCNET_SYSTEM_PROMPT+x}" ]]; then
+  SYSTEM_PROMPT="$SCNET_SYSTEM_PROMPT"
+  PRESET="custom"
+else
+  case "$PRESET" in
+    default) SYSTEM_PROMPT="$DEFAULT_SYSTEM_PROMPT" ;;
+    eva-rp) SYSTEM_PROMPT="$EVA_RP_SYSTEM_PROMPT" ;;
+    *) SYSTEM_PROMPT="$DEFAULT_SYSTEM_PROMPT" ;;
+  esac
+fi
 WAIT_FOR_RESULT=1
 DRY_RUN=0
 
@@ -103,6 +115,7 @@ Options (before the command):
   --partition NAME
   --model 14b|32b
   --mode job|server
+  --preset default|eva-rp
   --max-tokens N
   --poll-seconds N
   --system TEXT
@@ -154,6 +167,7 @@ validate_settings() {
   validate_name "$PARTITION" "partition"
   case "$MODEL" in 14b|32b) ;; *) die "model must be 14b or 32b" ;; esac
   case "$MODE" in job|server) ;; *) die "mode must be job or server" ;; esac
+  case "$PRESET" in default|eva-rp|custom) ;; *) die "preset must be default or eva-rp" ;; esac
   validate_uint "$MAX_TOKENS" "max-tokens"
   (( MAX_TOKENS >= 1 && MAX_TOKENS <= 4096 )) || die "max-tokens must be 1-4096"
   validate_uint "$POLL_SECONDS" "poll-seconds"
@@ -434,6 +448,27 @@ json_quote() {
   fi
 }
 
+apply_preset() {
+  case "$1" in
+    default)
+      PRESET=default
+      SYSTEM_PROMPT="$DEFAULT_SYSTEM_PROMPT"
+      ;;
+    eva-rp)
+      PRESET=eva-rp
+      SYSTEM_PROMPT="$EVA_RP_SYSTEM_PROMPT"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+show_preset() {
+  printf 'preset=%s\n' "$PRESET"
+  printf 'system_prompt=%s\n' "$SYSTEM_PROMPT"
+}
+
 server_prompt() {
   prompt="$1"
   validate_settings
@@ -540,6 +575,8 @@ Enter a question to submit a Slurm job.
 
 Commands:
   /mode job|server
+  /preset default|eva-rp
+  /preset show
   /serve start
   /serve status
   /serve stop
@@ -569,7 +606,8 @@ interactive_panel() {
   panel_help
 
   while :; do
-    printf '\n%s[%s tokens=%s]%s > ' "$BOLD" "$MODEL" "$MAX_TOKENS" "$RESET"
+    printf '\n%s[%s mode=%s preset=%s tokens=%s]%s > ' \
+      "$BOLD" "$MODEL" "$MODE" "$PRESET" "$MAX_TOKENS" "$RESET"
     IFS= read -r line || break
     [[ -n "$line" ]] || continue
     cmd="${line%% *}"
@@ -588,6 +626,23 @@ interactive_panel() {
           *) warn "usage: /mode job|server" ;;
         esac
         ;;
+      /preset)
+        case "$arg" in
+          default|eva-rp)
+            apply_preset "$arg"
+            ok "preset=$PRESET"
+            ;;
+          show)
+            show_preset
+            ;;
+          list|"")
+            say "available presets: default, eva-rp"
+            ;;
+          *)
+            warn "usage: /preset default|eva-rp|show"
+            ;;
+        esac
+        ;;
       /serve)
         case "$arg" in
           start) server_start ;;
@@ -601,7 +656,15 @@ interactive_panel() {
         if (( arg < 1 || arg > 4096 )); then warn "usage: /tokens 1-4096"; continue; fi
         MAX_TOKENS="$arg"; ok "max_tokens=$MAX_TOKENS"
         ;;
-      /system) if [[ -n "$arg" ]]; then SYSTEM_PROMPT="$arg"; ok "system prompt updated"; else say "$SYSTEM_PROMPT"; fi ;;
+      /system)
+        if [[ -n "$arg" ]]; then
+          SYSTEM_PROMPT="$arg"
+          PRESET=custom
+          ok "system prompt updated; preset=custom"
+        else
+          show_preset
+        fi
+        ;;
       /file) if [[ -f "$arg" ]]; then submit_prompt "$(cat "$arg")"; else warn "file not found: $arg"; fi ;;
       /status) show_status "$arg" ;;
       /result) show_result "$arg" ;;
@@ -627,9 +690,19 @@ while [[ $# -gt 0 ]]; do
     --partition) [[ $# -ge 2 ]] || die "--partition needs a value"; PARTITION="$2"; shift 2 ;;
     --model) [[ $# -ge 2 ]] || die "--model needs a value"; MODEL="$2"; shift 2 ;;
     --mode) [[ $# -ge 2 ]] || die "--mode needs a value"; MODE="$2"; shift 2 ;;
+    --preset)
+      [[ $# -ge 2 ]] || die "--preset needs a value"
+      apply_preset "$2" || die "--preset must be default or eva-rp"
+      shift 2
+      ;;
     --max-tokens) [[ $# -ge 2 ]] || die "--max-tokens needs a value"; MAX_TOKENS="$2"; shift 2 ;;
     --poll-seconds) [[ $# -ge 2 ]] || die "--poll-seconds needs a value"; POLL_SECONDS="$2"; shift 2 ;;
-    --system) [[ $# -ge 2 ]] || die "--system needs a value"; SYSTEM_PROMPT="$2"; shift 2 ;;
+    --system)
+      [[ $# -ge 2 ]] || die "--system needs a value"
+      SYSTEM_PROMPT="$2"
+      PRESET=custom
+      shift 2
+      ;;
     --no-wait) WAIT_FOR_RESULT=0; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;

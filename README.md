@@ -76,6 +76,9 @@ ${EDITOR:-vi} ~/.config/scnet-aichat/config
 /model 32b
 /mode job
 /mode server
+/preset eva-rp
+/preset default
+/preset show
 /serve start
 /serve status
 /serve stop
@@ -97,11 +100,48 @@ ${EDITOR:-vi} ~/.config/scnet-aichat/config
 ./scnet-aichat ask "请解释张量并行。"
 ./scnet-aichat --model 32b --max-tokens 256 ask "写一个简短示例。"
 ./scnet-aichat --mode server --model 14b ask "连续问答的第一问。"
+./scnet-aichat --mode server --model 14b --preset eva-rp ask "开始角色扮演。"
 ./scnet-aichat --no-wait ask "生成报告。"
 ./scnet-aichat result JOB_ID
 ```
 
 每次提交都会返回 `JOB_ID`。本地历史保存在 `~/.scnet-aichat/jobs.tsv`。
+
+### EVA 角色扮演预设
+
+在交互面板中启用：
+
+```text
+/preset eva-rp
+```
+
+查看当前预设：
+
+```text
+/preset show
+```
+
+恢复普通助手：
+
+```text
+/preset default
+```
+
+`eva-rp` 会自动设置专用 system prompt，要求模型：
+
+- 遵守角色卡和世界设定；
+- 保持人物性格、关系、记忆和场景连续性；
+- 不跳出角色、不总结剧情；
+- 不替用户决定或描述用户角色的行动；
+- 成人向虚构情节中所有参与者必须明确为成年人且自愿；
+- 禁止未成年人或年龄含糊的相关情节。
+
+使用示例：
+
+```bash
+./scnet-aichat --mode server --model 14b --preset eva-rp ask \
+  "角色卡：林岚，32岁，冷静克制的私人秘书。场景：深夜办公室。请以角色身份开始。"
+```
 
 ### 在面板里使用持久模式
 
