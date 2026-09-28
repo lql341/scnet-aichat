@@ -18,6 +18,9 @@ pass() {
   printf 'PASS: %s\n' "$*"
 }
 
+TMP_INSTALL="$(mktemp -d "${TMPDIR:-/tmp}/scnet-aichat-test.XXXXXX")"
+trap 'rm -rf "$TMP_INSTALL"' EXIT
+
 /bin/bash -n "$CLIENT" "$WORKER" "$SERVER_JOB" "$SERVER_BUILD" "$SERVER_START" ||
   fail "Bash syntax"
 pass "Bash syntax"
@@ -30,6 +33,12 @@ pass "Bash 3.2 compatibility scan"
 
 "$CLIENT" --help >/dev/null || fail "help command"
 pass "help command"
+
+"$ROOT/install.sh" --prefix "$TMP_INSTALL/prefix" --no-init-config ||
+  fail "user-prefix installer"
+"$TMP_INSTALL/prefix/bin/scnet-aichat" --help >/dev/null ||
+  fail "installed client"
+pass "user-prefix installer"
 
 dry14="$(SCNET_REMOTE_HOME=/remote/home "$CLIENT" --dry-run --model 14b ask test)"
 printf '%s\n' "$dry14" | grep -q 'resources=dcu:1 cpu:8 mem:27gb' ||

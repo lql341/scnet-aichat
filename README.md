@@ -16,6 +16,28 @@
 
 ## 一、安装和首次运行
 
+新机器的完整交接说明见 [`docs/HANDOFF.md`](docs/HANDOFF.md)；架构说明见
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)，容器 API 说明见
+[`docs/CONTAINER_API.md`](docs/CONTAINER_API.md)。
+
+### Agent 一句话安装
+
+仓库是私有的，因此执行前需要本机已经配置 GitHub SSH key，或已经运行
+`gh auth login`。Agent 可直接执行下面的一句话：
+
+```bash
+bash -lc 'set -eu; d="${SCNET_AICHAT_DIR:-$HOME/.local/src/scnet-aichat}"; if [ -d "$d/.git" ]; then git -C "$d" pull --ff-only; else mkdir -p "$(dirname "$d")"; git clone git@github.com:lql341/scnet-aichat.git "$d"; fi; "$d/install.sh" --check --remote-install'
+```
+
+该命令会安装本地客户端、初始化配置（只在配置不存在时创建）、上传远端 worker，
+并运行本地和远端检查；不会下载模型、覆盖已有配置或删除远端数据。
+
+如果使用 GitHub CLI：
+
+```bash
+bash -lc 'set -eu; d="${SCNET_AICHAT_DIR:-$HOME/.local/src/scnet-aichat}"; if [ -d "$d/.git" ]; then git -C "$d" pull --ff-only; else mkdir -p "$(dirname "$d")"; gh repo clone lql341/scnet-aichat "$d"; fi; "$d/install.sh" --check --remote-install'
+```
+
 ### 1. 准备 SSH profile
 
 客户端只调用 SSH profile，不保存私钥。`~/.ssh/config` 的最小示例：
@@ -52,6 +74,20 @@ ${EDITOR:-vi} ~/.config/scnet-aichat/config
 `SCNET_MODEL_32B_PATH`。
 
 本机不需要安装 PyTorch、vLLM、ROCm 或 llama.cpp；这些都在远端运行。
+
+如果不想使用安装器，也可以人工执行：
+
+```bash
+./tests/test.sh
+mkdir -p ~/.local/bin ~/.local/share/scnet-aichat
+cp scnet-aichat ~/.local/bin/scnet-aichat
+cp -R worker server config.example ~/.local/share/scnet-aichat/
+chmod 755 ~/.local/bin/scnet-aichat
+```
+
+然后把 `~/.local/bin` 加入 `PATH`，创建并编辑
+`~/.config/scnet-aichat/config`，最后执行 `scnet-aichat install` 和
+`scnet-aichat doctor`。
 
 ### 3. 安装远端 worker 并检查
 
