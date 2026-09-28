@@ -6,11 +6,62 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG_FILE="${SCNET_AICHAT_CONFIG:-${HOME}/.config/scnet-aichat/config}"
+CONFIG_DIR="$(dirname "$CONFIG_FILE")"
+export SCNET_AICHAT_CONFIG_DIR="${SCNET_AICHAT_CONFIG_DIR:-$CONFIG_DIR}"
+
+config_die() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+load_config() {
+  config_path="$1"
+  while IFS= read -r config_line || [[ -n "$config_line" ]]; do
+    config_line="${config_line#"${config_line%%[![:space:]]*}"}"
+    case "$config_line" in ""|\#*) continue ;; esac
+    config_key="${config_line%%=*}"
+    config_value="${config_line#*=}"
+    [[ "$config_key" != "$config_line" ]] ||
+      config_die "invalid config line in $config_path"
+    case "$config_key" in
+      SCNET_[A-Z0-9_]*) ;;
+      *) config_die "unsupported config key: $config_key" ;;
+    esac
+    case "$config_key" in
+      *ACCESS_KEY*|*SECRET_KEY*|*API_KEY*|*TOKEN*|*PASSWORD*)
+        config_die "credentials are not allowed in config: $config_key"
+        ;;
+      SCNET_OPENAPI_REGION_ID|SCNET_OPENAPI_SCHEDULER_ID)
+        config_die "$config_key is managed by scnet-aichat setup"
+        ;;
+    esac
+    config_value="${config_value#"${config_value%%[![:space:]]*}"}"
+    config_value="${config_value%"${config_value##*[![:space:]]}"}"
+    case "$config_value" in
+      \"*\")
+        [[ "${config_value: -1}" == '"' ]] ||
+          config_die "unterminated quoted value for $config_key"
+        config_value="${config_value:1:${#config_value}-2}"
+        ;;
+      \'*\')
+        [[ "${config_value: -1}" == "'" ]] ||
+          config_die "unterminated quoted value for $config_key"
+        config_value="${config_value:1:${#config_value}-2}"
+        ;;
+    esac
+    printf -v "$config_key" '%s' "$config_value"
+  done < "$config_path"
+}
+
 if [[ -f "$CONFIG_FILE" ]]; then
-  # shellcheck disable=SC1090
-  . "$CONFIG_FILE"
+  load_config "$CONFIG_FILE"
 fi
 
+BACKEND="${SCNET_BACKEND:-}"
+if [[ -z "$BACKEND" && -f "${CONFIG_DIR}/backend" ]]; then
+  IFS= read -r BACKEND < "${CONFIG_DIR}/backend" || true
+fi
+BACKEND="${BACKEND:-ssh}"
 PROFILE="${SCNET_PROFILE:-kseshell}"
 PARTITION="${SCNET_PARTITION:-kshdnormal}"
 MODEL="${SCNET_MODEL:-14b}"
@@ -55,14 +106,29 @@ MODEL_14B_PATH="${SCNET_MODEL_14B_PATH:-}"
 MODEL_32B_PATH="${SCNET_MODEL_32B_PATH:-}"
 LLAMA_SERVER="${SCNET_LLAMA_SERVER:-}"
 SERVER_PORT="${SCNET_SERVER_PORT:-18080}"
+SERVER_START_TIMEOUT="${SCNET_SERVER_START_TIMEOUT:-900}"
+OPENAPI_TIMEOUT="${SCNET_OPENAPI_TIMEOUT:-30}"
 
 find_worker() {
   for candidate in \
     "${SCNET_AICHAT_WORKER_LOCAL:-}" \
     "${SCRIPT_DIR}/worker/scnet-aichat-worker.slurm" \
-    "${SCRIPT_DIR}/../share/scnet-aichat/scnet-aichat-worker.slurm"; do
+    "${SCRIPT_DIR}/../share/scnet-aichat/worker/scnet-aichat-worker.slurm"; do
     if [[ -n "$candidate" && -f "$candidate" ]]; then
       WORKER_LOCAL="$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+find_openapi_helper() {
+  for candidate in \
+    "${SCNET_AICHAT_OPENAPI_HELPER:-}" \
+    "${SCRIPT_DIR}/scripts/scnet-openapi.py" \
+    "${SCRIPT_DIR}/../share/scnet-aichat/scripts/scnet-openapi.py"; do
+    if [[ -n "$candidate" && -f "$candidate" ]]; then
+      OPENAPI_HELPER="$candidate"
       return 0
     fi
   done
@@ -79,6 +145,15 @@ find_server_script() {
     fi
   done
   return 1
+}
+
+reset_remote_layout() {
+  REMOTE_HOME="${SCNET_REMOTE_HOME:-}"
+  REMOTE_APP_DIR="${SCNET_REMOTE_APP_DIR:-}"
+  LLAMA_CLI="${SCNET_LLAMA_CLI:-}"
+  MODEL_14B_PATH="${SCNET_MODEL_14B_PATH:-}"
+  MODEL_32B_PATH="${SCNET_MODEL_32B_PATH:-}"
+  LLAMA_SERVER="${SCNET_LLAMA_SERVER:-}"
 }
 
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
@@ -102,6 +177,7 @@ usage() {
   cat <<'EOF'
 Usage:
   scnet-aichat                           interactive panel
+  scnet-aichat setup [new|modify|status|reset|reset-credentials]
   scnet-aichat install                   install/update remote worker
   scnet-aichat doctor                    validate local and remote setup
   scnet-aichat ask "question"            submit and wait
@@ -111,6 +187,7 @@ Usage:
   scnet-aichat history
 
 Options (before the command):
+  --backend ssh|openapi
   --profile NAME
   --partition NAME
   --model 14b|32b
@@ -125,9 +202,22 @@ EOF
 }
 
 require_tools() {
-  for tool in ssh scp awk mktemp; do
+  tools="awk mktemp"
+  if [[ "$BACKEND" == "ssh" ]]; then
+    tools="$tools ssh scp"
+  else
+    tools="$tools python3"
+  fi
+  for tool in $tools; do
     command -v "$tool" >/dev/null 2>&1 || die "missing local command: $tool"
   done
+}
+
+openapi_run() {
+  find_openapi_helper || die "cannot find scripts/scnet-openapi.py"
+  command_args=()
+  command_args+=(--timeout "$OPENAPI_TIMEOUT")
+  python3 "$OPENAPI_HELPER" "${command_args[@]}" "$@"
 }
 
 ssh_run() {
@@ -150,6 +240,22 @@ validate_uint() {
   esac
 }
 
+validate_memory() {
+  value="$1"
+  label="$2"
+  if [[ ! "$value" =~ ^[0-9]+([KkMmGgTt][Bb]?)?$ ]]; then
+    die "$label has an invalid format"
+  fi
+}
+
+validate_walltime() {
+  value="$1"
+  label="$2"
+  if [[ ! "$value" =~ ^([0-9]+-)?[0-9]{1,3}:[0-9]{2}:[0-9]{2}$ ]]; then
+    die "$label must use HH:MM:SS or D-HH:MM:SS"
+  fi
+}
+
 validate_remote_path() {
   value="$1"
   label="$2"
@@ -163,6 +269,7 @@ validate_remote_path() {
 }
 
 validate_settings() {
+  case "$BACKEND" in ssh|openapi) ;; *) die "backend must be ssh or openapi" ;; esac
   validate_name "$PROFILE" "SSH profile"
   validate_name "$PARTITION" "partition"
   case "$MODEL" in 14b|32b) ;; *) die "model must be 14b or 32b" ;; esac
@@ -172,11 +279,32 @@ validate_settings() {
   (( MAX_TOKENS >= 1 && MAX_TOKENS <= 4096 )) || die "max-tokens must be 1-4096"
   validate_uint "$POLL_SECONDS" "poll-seconds"
   (( POLL_SECONDS >= 1 && POLL_SECONDS <= 300 )) || die "poll-seconds must be 1-300"
+  validate_uint "$SERVER_START_TIMEOUT" "server start timeout"
+  (( SERVER_START_TIMEOUT >= 30 && SERVER_START_TIMEOUT <= 86400 )) ||
+    die "server start timeout must be 30-86400"
+  validate_uint "$OPENAPI_TIMEOUT" "OpenAPI timeout"
+  (( OPENAPI_TIMEOUT >= 1 && OPENAPI_TIMEOUT <= 600 )) ||
+    die "OpenAPI timeout must be 1-600"
+  case "$GCC_MODULE:$DTK_MODULE" in
+    *[!A-Za-z0-9_./:+-]*) die "unsafe module name" ;;
+  esac
 }
 
 resolve_remote_layout() {
-  [[ -n "$REMOTE_HOME" ]] || REMOTE_HOME="$(ssh_run 'printf %s "$HOME"')" ||
-    die "cannot discover remote HOME"
+  if [[ -z "$REMOTE_HOME" ]]; then
+    if [[ "$BACKEND" == "openapi" ]]; then
+      if (( DRY_RUN == 1 )); then
+        REMOTE_HOME="/remote/home"
+      else
+        context="$(openapi_run context)" || die "cannot discover OpenAPI context"
+        IFS=$'\t' read -r REMOTE_HOME OPENAPI_USERNAME \
+          OPENAPI_RESOLVED_REGION OPENAPI_RESOLVED_SCHEDULER <<< "$context"
+      fi
+    else
+      REMOTE_HOME="$(ssh_run 'printf %s "$HOME"')" ||
+        die "cannot discover remote HOME"
+    fi
+  fi
   validate_remote_path "$REMOTE_HOME" "remote HOME"
 
   [[ -n "$REMOTE_APP_DIR" ]] || REMOTE_APP_DIR="${REMOTE_HOME}/.scnet-aichat"
@@ -212,6 +340,15 @@ install_worker() {
   require_tools
   resolve_remote_layout
   find_worker || die "cannot find scnet-aichat-worker.slurm"
+  if [[ "$BACKEND" == "openapi" ]]; then
+    openapi_run install-worker \
+      --worker "$WORKER_LOCAL" \
+      --remote-app-dir "$REMOTE_APP_DIR" >/dev/null ||
+      die "worker upload through OpenAPI failed"
+    ok "Installed OpenAPI worker"
+    return 0
+  fi
+
   find_server_script || die "cannot find server/llama-server.slurm"
 
   remote_worker="${REMOTE_APP_DIR}/worker.slurm"
@@ -232,6 +369,14 @@ install_worker() {
 }
 
 ensure_worker() {
+  if [[ "$BACKEND" == "openapi" ]]; then
+    find_worker || die "cannot find scnet-aichat-worker.slurm"
+    openapi_run install-worker \
+      --worker "$WORKER_LOCAL" \
+      --remote-app-dir "$REMOTE_APP_DIR" >/dev/null ||
+      die "worker upload through OpenAPI failed"
+    return 0
+  fi
   remote_worker="${REMOTE_APP_DIR}/worker.slurm"
   if ! ssh_run "test -x '$remote_worker'" >/dev/null 2>&1; then
     warn "Remote worker is missing; installing it now."
@@ -255,17 +400,34 @@ set_resources() {
   esac
   validate_uint "$JOB_GPUS" "GPU count"
   validate_uint "$JOB_CPUS" "CPU count"
+  validate_memory "$JOB_MEM" "memory"
+  validate_walltime "$JOB_TIME" "walltime"
 }
 
 record_job() {
-  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$(date '+%Y-%m-%dT%H:%M:%S%z')" >> "$JOBS_FILE"
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$1" "$2" "$3" "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$4" >> "$JOBS_FILE"
 }
 
 lookup_request() {
   awk -F '	' -v id="$1" '$1 == id { value = $2 } END { print value }' "$JOBS_FILE"
 }
 
+lookup_backend() {
+  awk -F '	' -v id="$1" '
+    $1 == id { found = 1; value = $5 }
+    END {
+      if (found) print (value == "" ? "ssh" : value)
+    }
+  ' \
+    "$JOBS_FILE"
+}
+
 job_state() {
+  if [[ "$BACKEND" == "openapi" ]]; then
+    openapi_run job "$1" --field state 2>/dev/null || true
+    return
+  fi
   line="$(ssh_run "sacct -j '$1' --format=State,ExitCode -n -P | head -n 1" 2>/dev/null || true)"
   state="${line%%|*}"
   state="$(printf '%s' "$state" | tr -d '[:space:]')"
@@ -276,12 +438,90 @@ job_state() {
   printf '%s\n' "$state"
 }
 
+redact_remote_path() {
+  value="$1"
+  if [[ -n "$REMOTE_HOME" && "$value" == "$REMOTE_HOME"* ]]; then
+    printf '$REMOTE_HOME%s\n' "${value#"$REMOTE_HOME"}"
+  else
+    printf '%s\n' "$value"
+  fi
+}
+
+submit_prompt_openapi() {
+  prompt="$1"
+  request_id="$(date '+%Y%m%dT%H%M%S')-$$-${RANDOM}"
+  request_dir="${REMOTE_APP_DIR}/requests/${request_id}"
+  remote_worker="${REMOTE_APP_DIR}/scnet-aichat-worker.slurm"
+
+  worker_command="export EVA_REQUEST_DIR='${request_dir}' EVA_MODEL_KEY='${MODEL}'"
+  worker_command="$worker_command SCNET_GCC_MODULE='${GCC_MODULE}'"
+  worker_command="$worker_command SCNET_DTK_MODULE='${DTK_MODULE}';"
+  worker_command="$worker_command bash -l '${remote_worker}'"
+
+  if (( DRY_RUN == 1 )); then
+    say "backend=openapi"
+    say "model=$MODEL"
+    say "model_path=$(redact_remote_path "$MODEL_PATH")"
+    say "llama_cli=$(redact_remote_path "$LLAMA_CLI")"
+    say "work_dir=$(redact_remote_path "$request_dir")"
+    say "resources=dcu:${JOB_GPUS} cpu:${JOB_CPUS} mem:${JOB_MEM} time:${JOB_TIME}"
+    say "command=$worker_command" | sed "s#${REMOTE_HOME}#\\\$REMOTE_HOME#g"
+    return 0
+  fi
+
+  init_state
+  find_worker || die "cannot find scnet-aichat-worker.slurm"
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/scnet-aichat.XXXXXX")" ||
+    die "cannot create temporary directory"
+  trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
+  printf '%s\n' "$prompt" > "${tmp_dir}/prompt.txt"
+  printf '%s\n' "$SYSTEM_PROMPT" > "${tmp_dir}/system.txt"
+  printf '%s\n' "$MAX_TOKENS" > "${tmp_dir}/max_tokens"
+  printf '%s\n' "$LLAMA_CLI" > "${tmp_dir}/llama_cli"
+  printf '%s\n' "$MODEL_PATH" > "${tmp_dir}/model_path"
+
+  job_id="$(openapi_run submit-chat \
+    --worker "$WORKER_LOCAL" \
+    --request-dir "$request_dir" \
+    --file "${tmp_dir}/prompt.txt" \
+    --file "${tmp_dir}/system.txt" \
+    --file "${tmp_dir}/max_tokens" \
+    --file "${tmp_dir}/llama_cli" \
+    --file "${tmp_dir}/model_path" \
+    --name "scnet-aichat-${MODEL}" \
+    --command "$worker_command" \
+    --queue "$PARTITION" \
+    --cpus "$JOB_CPUS" \
+    --dcus "$JOB_GPUS" \
+    --memory "$JOB_MEM" \
+    --walltime "$JOB_TIME" \
+    --stdout "${request_dir}/slurm-%j.out" \
+    --stderr "${request_dir}/slurm-%j.err")" ||
+    die "OpenAPI job submission failed"
+  rm -rf "$tmp_dir"
+  trap - EXIT HUP INT TERM
+  case "$job_id" in ""|*[!0-9]*) die "cannot parse OpenAPI job id: $job_id" ;; esac
+  record_job "$job_id" "$request_dir" "$MODEL" "openapi"
+  ok "Submitted job=$job_id backend=openapi model=$MODEL dcu=$JOB_GPUS cpu=$JOB_CPUS mem=$JOB_MEM"
+
+  if (( WAIT_FOR_RESULT == 1 )); then
+    wait_for_job "$job_id"
+  else
+    say "Run later: $0 result $job_id"
+  fi
+}
+
 submit_prompt() {
   prompt="$1"
   validate_settings
   require_tools
   resolve_remote_layout
   set_resources
+
+  if [[ "$BACKEND" == "openapi" ]]; then
+    submit_prompt_openapi "$prompt"
+    return
+  fi
 
   request_id="$(date '+%Y%m%dT%H%M%S')-$$-${RANDOM}"
   request_dir="${REMOTE_APP_DIR}/requests/${request_id}"
@@ -293,17 +533,18 @@ submit_prompt() {
   submit_cmd="$submit_cmd --job-name=scnet-aichat-${MODEL}"
   submit_cmd="$submit_cmd --output=${request_dir}/slurm-%j.out"
   submit_cmd="$submit_cmd --error=${request_dir}/slurm-%j.err"
-  submit_cmd="$submit_cmd --export=ALL,LC_ALL=C,LANG=C,LANGUAGE=C"
+  submit_cmd="$submit_cmd --export=LC_ALL=C,LANG=C,LANGUAGE=C"
   submit_cmd="$submit_cmd,EVA_REQUEST_DIR=${request_dir},EVA_MODEL_KEY=${MODEL}"
   submit_cmd="$submit_cmd,SCNET_GCC_MODULE=${GCC_MODULE},SCNET_DTK_MODULE=${DTK_MODULE}"
   submit_cmd="$submit_cmd ${remote_worker}"
 
   if (( DRY_RUN == 1 )); then
+    say "backend=ssh"
     say "model=$MODEL"
-    say "model_path=$MODEL_PATH"
-    say "llama_cli=$LLAMA_CLI"
+    say "model_path=$(redact_remote_path "$MODEL_PATH")"
+    say "llama_cli=$(redact_remote_path "$LLAMA_CLI")"
     say "resources=dcu:${JOB_GPUS} cpu:${JOB_CPUS} mem:${JOB_MEM} time:${JOB_TIME}"
-    say "$submit_cmd"
+    say "$submit_cmd" | sed "s#${REMOTE_HOME}#\\\$REMOTE_HOME#g"
     return 0
   fi
 
@@ -311,6 +552,7 @@ submit_prompt() {
   ensure_worker
   tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/scnet-aichat.XXXXXX")" ||
     die "cannot create temporary directory"
+  trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
   printf '%s\n' "$prompt" > "${tmp_dir}/prompt.txt"
   printf '%s\n' "$SYSTEM_PROMPT" > "${tmp_dir}/system.txt"
   printf '%s\n' "$MAX_TOKENS" > "${tmp_dir}/max_tokens"
@@ -329,11 +571,12 @@ submit_prompt() {
       die "request upload failed"
     }
   rm -rf "$tmp_dir"
+  trap - EXIT HUP INT TERM
 
   output="$(ssh_run "$submit_cmd")" || die "sbatch failed"
   job_id="${output%%;*}"
   case "$job_id" in ""|*[!0-9]*) die "cannot parse job id: $output" ;; esac
-  record_job "$job_id" "$request_dir" "$MODEL"
+  record_job "$job_id" "$request_dir" "$MODEL" "ssh"
   ok "Submitted job=$job_id model=$MODEL dcu=$JOB_GPUS cpu=$JOB_CPUS mem=$JOB_MEM"
 
   if (( WAIT_FOR_RESULT == 1 )); then
@@ -348,6 +591,8 @@ server_job_id() {
 }
 
 server_start() {
+  [[ "$BACKEND" == "ssh" ]] ||
+    die "persistent server mode currently requires backend=ssh"
   validate_settings
   require_tools
   resolve_remote_layout
@@ -359,7 +604,7 @@ server_start() {
   server_cmd="$server_cmd --job-name=scnet-server-${MODEL}"
   server_cmd="$server_cmd --output=${REMOTE_APP_DIR}/server/slurm-%j.out"
   server_cmd="$server_cmd --error=${REMOTE_APP_DIR}/server/slurm-%j.err"
-  server_cmd="$server_cmd --export=ALL,LC_ALL=C,LANG=C,LANGUAGE=C"
+  server_cmd="$server_cmd --export=LC_ALL=C,LANG=C,LANGUAGE=C"
   server_cmd="$server_cmd,SCNET_SERVER_APP_DIR=${REMOTE_APP_DIR}"
   server_cmd="$server_cmd,SCNET_SERVER_MODEL=${MODEL_PATH}"
   server_cmd="$server_cmd,SCNET_LLAMA_SERVER=${LLAMA_SERVER}"
@@ -368,10 +613,10 @@ server_start() {
 
   if (( DRY_RUN == 1 )); then
     say "persistent_model=$MODEL"
-    say "persistent_binary=$LLAMA_SERVER"
+    say "persistent_binary=$(redact_remote_path "$LLAMA_SERVER")"
     say "persistent_port=$SERVER_PORT"
     say "resources=dcu:${JOB_GPUS} cpu:${JOB_CPUS} mem:${JOB_MEM} time:${JOB_TIME}"
-    say "$server_cmd"
+    say "$server_cmd" | sed "s#${REMOTE_HOME}#\\\$REMOTE_HOME#g"
     return 0
   fi
 
@@ -393,8 +638,11 @@ server_start() {
   output="$(ssh_run "$server_cmd")" || die "persistent server sbatch failed"
   job_id="${output%%;*}"
   case "$job_id" in ""|*[!0-9]*) die "cannot parse server job id: $output" ;; esac
+  ssh_run "printf '%s\n' '$job_id' > '${REMOTE_APP_DIR}/server/job_id' && printf '%s\n' '$MODEL_PATH' > '${REMOTE_APP_DIR}/server/model'" ||
+    die "cannot record persistent server job id; submitted job=$job_id"
   ok "Started persistent server job=$job_id model=$MODEL"
   last=""
+  started_waiting_at="$(date '+%s')"
   while :; do
     state="$(job_state "$job_id")"
     if [[ "$state" != "$last" ]]; then
@@ -410,17 +658,29 @@ server_start() {
       ok "Persistent server is ready on port $SERVER_PORT"
       return 0
     fi
+    now="$(date '+%s')"
+    if (( now - started_waiting_at >= SERVER_START_TIMEOUT )); then
+      die "persistent server did not become ready within ${SERVER_START_TIMEOUT}s; job=$job_id remains submitted, run /serve stop to cancel it"
+    fi
     sleep "$POLL_SECONDS"
   done
 }
 
 server_stop() {
+  [[ "$BACKEND" == "ssh" ]] ||
+    die "persistent server mode currently requires backend=ssh"
   validate_settings
   require_tools
   resolve_remote_layout
   job_id="$(server_job_id || true)"
   case "$job_id" in
     ""|*[!0-9]*) warn "No persistent server job found"; return 0 ;;
+  esac
+  job_name="$(ssh_run "squeue -h -j '$job_id' -o '%j' | head -n 1; sacct -X -j '$job_id' --format=JobName -n -P | head -n 1" 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"
+  case "$job_name" in
+    scnet-server-*) ;;
+    "") die "cannot verify persistent server job=$job_id; refusing to cancel" ;;
+    *) die "job=$job_id is not a scnet-aichat server job; refusing to cancel" ;;
   esac
   ssh_run "scancel '$job_id'" || die "persistent server scancel failed"
   ssh_run "rm -f '${REMOTE_APP_DIR}/server/job_id'" || true
@@ -428,6 +688,8 @@ server_stop() {
 }
 
 server_status() {
+  [[ "$BACKEND" == "ssh" ]] ||
+    die "persistent server mode currently requires backend=ssh"
   validate_settings
   require_tools
   resolve_remote_layout
@@ -435,7 +697,7 @@ server_status() {
   case "$job_id" in
     ""|*[!0-9]*) warn "No persistent server job found"; return 0 ;;
   esac
-  show_status "$job_id"
+  ssh_run "sacct -j '$job_id' --format=JobID,JobName,Partition,State,ExitCode,Elapsed,AllocTRES -P"
 }
 
 json_quote() {
@@ -470,6 +732,8 @@ show_preset() {
 }
 
 server_prompt() {
+  [[ "$BACKEND" == "ssh" ]] ||
+    die "persistent server mode currently requires backend=ssh"
   prompt="$1"
   validate_settings
   require_tools
@@ -504,7 +768,23 @@ server_prompt() {
 
 show_status() {
   case "$1" in ""|*[!0-9]*) die "JOB_ID must be numeric" ;; esac
-  ssh_run "sacct -j '$1' --format=JobID,JobName,Partition,State,ExitCode,Elapsed,AllocTRES -P"
+  original_backend="$BACKEND"
+  init_state
+  recorded_backend="$(lookup_backend "$1")"
+  if [[ -n "$recorded_backend" && "$recorded_backend" != "$BACKEND" ]]; then
+    BACKEND="$recorded_backend"
+    reset_remote_layout
+  fi
+  validate_settings
+  require_tools
+  if [[ "$BACKEND" == "openapi" ]]; then
+    resolve_remote_layout
+    openapi_run job "$1"
+  else
+    ssh_run "sacct -j '$1' --format=JobID,JobName,Partition,State,ExitCode,Elapsed,AllocTRES -P"
+  fi
+  BACKEND="$original_backend"
+  reset_remote_layout
 }
 
 show_result() {
@@ -512,27 +792,65 @@ show_result() {
   init_state
   request_dir="$(lookup_request "$1")"
   [[ -n "$request_dir" ]] || die "job $1 is not in the local history"
+  original_backend="$BACKEND"
+  recorded_backend="$(lookup_backend "$1")"
+  if [[ -n "$recorded_backend" && "$recorded_backend" != "$BACKEND" ]]; then
+    BACKEND="$recorded_backend"
+    reset_remote_layout
+  fi
+  validate_settings
+  require_tools
+  resolve_remote_layout
   state_now="$(job_state "$1")"
   info "job=$1 state=${state_now:-UNKNOWN}"
 
-  if ssh_run "test -f '${request_dir}/answer.txt'" >/dev/null 2>&1; then
-    printf '\n%sAnswer%s\n\n' "$BOLD" "$RESET"
-    ssh_run "cat '${request_dir}/answer.txt'"
-    printf '\n'
+  if [[ "$BACKEND" == "openapi" ]]; then
+    answer="$(openapi_run read "${request_dir}/answer.txt" 2>/dev/null || true)"
+    if [[ -n "$answer" ]]; then
+      printf '\n%sAnswer%s\n\n' "$BOLD" "$RESET"
+      printf '%s\n\n' "$answer"
+    else
+      warn "answer is not available yet"
+    fi
+    printf '%sPerformance%s\n' "$BOLD" "$RESET"
+    error_log="$(openapi_run read "${request_dir}/slurm-$1.err" 2>/dev/null || true)"
+    printf '%s\n' "$error_log" |
+      grep -aE 'load time|prompt eval time|eval time|total time' |
+      tail -n 5 || true
+    if [[ "$state_now" != "COMPLETED" ]]; then
+      printf '\n%sError log tail%s\n' "$BOLD" "$RESET"
+      printf '%s\n' "$error_log" | tail -n 30
+    fi
   else
-    warn "answer is not available yet"
-  fi
+    if ssh_run "test -f '${request_dir}/answer.txt'" >/dev/null 2>&1; then
+      printf '\n%sAnswer%s\n\n' "$BOLD" "$RESET"
+      ssh_run "cat '${request_dir}/answer.txt'"
+      printf '\n'
+    else
+      warn "answer is not available yet"
+    fi
 
-  printf '%sPerformance%s\n' "$BOLD" "$RESET"
-  ssh_run "grep -aE 'load time|prompt eval time|eval time|total time' '${request_dir}/slurm-$1.err' 2>/dev/null | tail -n 5" ||
-    true
-  if [[ "$state_now" != "COMPLETED" ]]; then
-    printf '\n%sError log tail%s\n' "$BOLD" "$RESET"
-    ssh_run "tail -n 30 '${request_dir}/slurm-$1.err' 2>/dev/null" || true
+    printf '%sPerformance%s\n' "$BOLD" "$RESET"
+    ssh_run "grep -aE 'load time|prompt eval time|eval time|total time' '${request_dir}/slurm-$1.err' 2>/dev/null | tail -n 5" ||
+      true
+    if [[ "$state_now" != "COMPLETED" ]]; then
+      printf '\n%sError log tail%s\n' "$BOLD" "$RESET"
+      ssh_run "tail -n 30 '${request_dir}/slurm-$1.err' 2>/dev/null" || true
+    fi
   fi
+  BACKEND="$original_backend"
+  reset_remote_layout
 }
 
 wait_for_job() {
+  if [[ "$BACKEND" == "openapi" ]]; then
+    if openapi_run wait "$1" --poll-seconds "$POLL_SECONDS"; then
+      show_result "$1"
+      return 0
+    fi
+    show_result "$1"
+    return 1
+  fi
   last=""
   while :; do
     current="$(job_state "$1")"
@@ -551,22 +869,58 @@ wait_for_job() {
 
 cancel_job() {
   case "$1" in ""|*[!0-9]*) die "JOB_ID must be numeric" ;; esac
-  ssh_run "scancel '$1'" || die "scancel failed"
+  original_backend="$BACKEND"
+  init_state
+  recorded_backend="$(lookup_backend "$1")"
+  if [[ -n "$recorded_backend" && "$recorded_backend" != "$BACKEND" ]]; then
+    BACKEND="$recorded_backend"
+    reset_remote_layout
+  fi
+  validate_settings
+  require_tools
+  if [[ "$BACKEND" == "openapi" ]]; then
+    resolve_remote_layout
+    openapi_run cancel "$1" >/dev/null || die "OpenAPI cancellation failed"
+  else
+    ssh_run "scancel '$1'" || die "scancel failed"
+  fi
   ok "Cancellation requested for job $1"
+  BACKEND="$original_backend"
+  reset_remote_layout
 }
 
 show_history() {
   init_state
-  printf 'JOB_ID\tREQUEST_DIR\tMODEL\tSUBMITTED_AT\n'
-  tail -n 30 "$JOBS_FILE"
+  printf 'JOB_ID\tMODEL\tSUBMITTED_AT\tBACKEND\n'
+  tail -n 30 "$JOBS_FILE" |
+    awk -F '	' 'BEGIN { OFS = "\t" } {
+      backend = ($5 == "" ? "ssh" : $5)
+      print $1, $3, $4, backend
+    }'
 }
 
 doctor() {
   validate_settings
   require_tools
-  resolve_remote_layout
   ok "Local prerequisites are available; Bash ${BASH_VERSION}"
+  if [[ "$BACKEND" == "openapi" ]]; then
+    openapi_run doctor || die "OpenAPI doctor failed"
+    find_worker || die "cannot find scnet-aichat-worker.slurm"
+    ok "OpenAPI helper and local worker are available"
+    return 0
+  fi
+  resolve_remote_layout
   ssh_run "test -x '${REMOTE_APP_DIR}/worker.slurm' && echo worker=ok || echo worker=missing; test -x '${REMOTE_APP_DIR}/server/llama-server.slurm' && echo server_script=ok || echo server_script=missing; test -x '$LLAMA_CLI' && echo llama_cli=ok || echo llama_cli=missing; test -x '$LLAMA_SERVER' && echo llama_server=ok || echo llama_server=missing; stat -c 'model_14b=%s' '$MODEL_14B_PATH'; stat -c 'model_32b=%s' '$MODEL_32B_PATH'; sinfo -p '$PARTITION' -h -o 'partition=%P state=%a nodes=%D' | head -n 1"
+}
+
+setup_openapi() {
+  command -v python3 >/dev/null 2>&1 || die "OpenAPI setup requires python3"
+  find_openapi_helper || die "cannot find scripts/scnet-openapi.py"
+  action="${1:-auto}"
+  case "$action" in auto|new|modify|status|reset|reset-credentials) ;; *)
+    die "setup action must be new, modify, status, reset, or reset-credentials"
+  esac
+  openapi_run setup "$action"
 }
 
 panel_help() {
@@ -574,6 +928,7 @@ panel_help() {
 Enter a question to submit a Slurm job.
 
 Commands:
+  /backend ssh|openapi
   /mode job|server
   /preset default|eva-rp
   /preset show
@@ -600,14 +955,13 @@ interactive_panel() {
   require_tools
   resolve_remote_layout
   init_state
-  ensure_worker
   printf '%sSCNet AI Chat%s\n' "$BOLD" "$RESET"
-  say "Mode=$MODE; questions run on $PARTITION."
+  say "Backend=$BACKEND; mode=$MODE; questions run on $PARTITION."
   panel_help
 
   while :; do
-    printf '\n%s[%s mode=%s preset=%s tokens=%s]%s > ' \
-      "$BOLD" "$MODEL" "$MODE" "$PRESET" "$MAX_TOKENS" "$RESET"
+    printf '\n%s[%s backend=%s mode=%s preset=%s tokens=%s]%s > ' \
+      "$BOLD" "$MODEL" "$BACKEND" "$MODE" "$PRESET" "$MAX_TOKENS" "$RESET"
     IFS= read -r line || break
     [[ -n "$line" ]] || continue
     cmd="${line%% *}"
@@ -616,6 +970,23 @@ interactive_panel() {
     case "$cmd" in
       /quit|/exit) break ;;
       /help) panel_help ;;
+      /backend)
+        case "$arg" in
+          ssh|openapi)
+            if [[ "$MODE" == "server" && "$arg" == "openapi" ]]; then
+              warn "persistent server mode currently requires backend=ssh"
+            else
+              BACKEND="$arg"
+              reset_remote_layout
+              validate_settings
+              require_tools
+              resolve_remote_layout
+              ok "backend=$BACKEND"
+            fi
+            ;;
+          *) warn "usage: /backend ssh|openapi" ;;
+        esac
+        ;;
       /model)
         case "$arg" in 14b|32b) MODEL="$arg"; ok "model=$MODEL" ;; *) warn "usage: /model 14b|32b" ;; esac
         ;;
@@ -686,6 +1057,7 @@ interactive_panel() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --backend) [[ $# -ge 2 ]] || die "--backend needs a value"; BACKEND="$2"; shift 2 ;;
     --profile) [[ $# -ge 2 ]] || die "--profile needs a value"; PROFILE="$2"; shift 2 ;;
     --partition) [[ $# -ge 2 ]] || die "--partition needs a value"; PARTITION="$2"; shift 2 ;;
     --model) [[ $# -ge 2 ]] || die "--model needs a value"; MODEL="$2"; shift 2 ;;
@@ -714,6 +1086,7 @@ command="${1:-panel}"
 [[ $# -eq 0 ]] || shift
 case "$command" in
   panel) interactive_panel ;;
+  setup) setup_openapi "${1:-auto}" ;;
   install) install_worker ;;
   doctor) doctor ;;
   ask) [[ $# -gt 0 ]] || die "ask needs a question"; if [[ "$MODE" == "server" ]]; then server_prompt "$*"; else submit_prompt "$*"; fi ;;

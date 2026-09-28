@@ -69,7 +69,9 @@ SHARE_DIR="${PREFIX}/share/scnet-aichat"
 CONFIG_DIR="${HOME}/.config/scnet-aichat"
 CONFIG_FILE="${SCNET_AICHAT_CONFIG:-${CONFIG_DIR}/config}"
 
-mkdir -p "$BIN_DIR" "$SHARE_DIR/worker" "$SHARE_DIR/server" "$CONFIG_DIR"
+mkdir -p \
+  "$BIN_DIR" "$SHARE_DIR/worker" "$SHARE_DIR/server" \
+  "$SHARE_DIR/scripts" "$CONFIG_DIR"
 install -m 755 "$SCRIPT_DIR/scnet-aichat" "$BIN_DIR/scnet-aichat"
 install -m 755 "$SCRIPT_DIR/worker/scnet-aichat-worker.slurm" \
   "$SHARE_DIR/worker/scnet-aichat-worker.slurm"
@@ -79,6 +81,8 @@ install -m 755 "$SCRIPT_DIR/server/build-server.sh" \
   "$SHARE_DIR/server/build-server.sh"
 install -m 755 "$SCRIPT_DIR/server/start-server.sh" \
   "$SHARE_DIR/server/start-server.sh"
+install -m 755 "$SCRIPT_DIR/scripts/scnet-openapi.py" \
+  "$SHARE_DIR/scripts/scnet-openapi.py"
 install -m 644 "$SCRIPT_DIR/config.example" "$SHARE_DIR/config.example"
 
 if [[ "$INIT_CONFIG" == "1" && ! -e "$CONFIG_FILE" ]]; then

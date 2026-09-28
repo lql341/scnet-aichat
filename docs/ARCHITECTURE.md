@@ -4,14 +4,21 @@
 
 ```text
 scnet-aichat
-  ├─ SSH upload prompt files
-  ├─ sbatch to kshdnormal
+  ├─ SSH backend: scp + sbatch
+  ├─ OpenAPI backend: efile upload + structured job submit
   ├─ worker loads one GGUF into GPU memory
   ├─ llama-cli generates one answer
   └─ worker exits and releases the allocation
 ```
 
 This mode is the default and is appropriate for occasional requests.
+
+OpenAPI credentials are loaded from environment variables, macOS Keychain, or Linux
+Secret Service. AK/SK are exchanged for a fresh region token on each invocation; tokens
+are not persisted. Region username, scheduler, and HOME are discovered from the selected
+region and cached only in a mode-0600 local metadata file. First-use setup presents
+authorized region names and highlights Kunshan by default; users never enter or manage
+Region IDs. `setup modify` can select future regions without changing the job backend.
 
 ## Persistent server mode
 
@@ -29,6 +36,10 @@ scnet-aichat
 The compute node is held by Slurm for the server walltime. Exiting the local panel does
 not stop it; `/serve stop` is required.
 
+Persistent mode currently requires the SSH backend because requests use `srun --overlap`
+inside an existing allocation. The server binds to `127.0.0.1`, not the compute-node
+network interface.
+
 The current persistent mode keeps the model process alive, but the Bash client does not
 automatically accumulate chat history. For multi-turn context, send previous messages in
 the request or use a future local conversation-history layer.
@@ -45,8 +56,8 @@ Do not change GPU count without changing CPU and memory together. The target que
 
 ## Container mode boundary
 
-The repository includes Dockerfile/server materials, but the Bash client currently uses
-Slurm/SSH as its production backend. SCNet container lifecycle APIs are a separate
+The repository includes Dockerfile/server materials, while the client currently uses
+Slurm through SSH or the HPC OpenAPI. SCNet container lifecycle APIs are a separate
 integration:
 
 ```text
@@ -59,8 +70,6 @@ GET  /ai/openapi/v2/instance-service/{id}/detail
 GET  /ai/openapi/v2/instance-service/{id}/url
 ```
 
-The current account was able to authenticate and query images, resource groups, mount
-directories, and instances. A reused terminated test instance accepted restart but
-remained `Waiting` for roughly 270 seconds before being stopped. This indicates that
-container API authorization works, while container DCU capacity/scheduling still needs
-confirmation. No new persistent container was left running.
+Container credentials and account-specific validation results are intentionally not
+stored in this repository. The container image requires `SCNET_SERVER_API_KEY` at
+runtime and does not expose an unauthenticated inference endpoint.

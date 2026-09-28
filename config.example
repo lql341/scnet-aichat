@@ -1,5 +1,8 @@
 # Copy this file to ~/.config/scnet-aichat/config and adjust as needed.
 
+# Leave unset to use the backend selected by `scnet-aichat setup`, otherwise ssh.
+# SCNET_BACKEND=ssh
+
 SCNET_PROFILE=kseshell
 SCNET_PARTITION=kshdnormal
 
@@ -28,6 +31,13 @@ SCNET_POLL_SECONDS=5
 # Persistent server settings. /mode server or --mode server starts it on demand.
 # SCNET_LLAMA_SERVER=/public/home/your-user/eva-k100/llama.cpp-b5046/build-gfx906/bin/llama-server
 SCNET_SERVER_PORT=18080
+SCNET_SERVER_START_TIMEOUT=900
+
+# OpenAPI metadata is discovered by `scnet-aichat setup` and stored locally
+# with mode 0600. AK/SK are stored in Keychain/Secret Service, never here.
+# Region and scheduler are selected interactively by `scnet-aichat setup`.
+# Their internal IDs are stored in private local metadata, not configured here.
+SCNET_OPENAPI_TIMEOUT=30
 
 # Resource mapping. Keep the CPU/DCU ratio valid for the target partition.
 SCNET_14B_GPUS=1

@@ -20,7 +20,12 @@ app_dir="${SCNET_SERVER_APP_DIR:-$HOME/.scnet-aichat}"
 binary="${SCNET_LLAMA_SERVER:-$HOME/eva-k100/llama.cpp-b5046/build-gfx906/bin/llama-server}"
 model="${SCNET_SERVER_MODEL:-$HOME/models/EVA-Qwen2.5-14B-v0.2-GGUF-Q4_0/EVA-Qwen2.5-14B-v0.2-Q4_0.gguf}"
 port="${SCNET_SERVER_PORT:-18080}"
-api_key="${SCNET_SERVER_API_KEY:-}"
+host="${SCNET_SERVER_HOST:-127.0.0.1}"
+
+case "$host" in
+  127.0.0.1|localhost) ;;
+  *) echo "SCNET_SERVER_HOST must remain loopback in Slurm mode" >&2; exit 64 ;;
+esac
 
 mkdir -p "$app_dir/server"
 [[ -x "$binary" ]] || { echo "missing llama-server: $binary" >&2; exit 69; }
@@ -42,7 +47,7 @@ trap cleanup EXIT
 
 args=(
   --model "$model"
-  --host 0.0.0.0
+  --host "$host"
   --port "$port"
   --ctx-size 4096
   --batch-size 256
@@ -52,8 +57,5 @@ args=(
   --jinja
   --metrics
 )
-if [[ -n "$api_key" ]]; then
-  args+=(--api-key "$api_key")
-fi
 
 exec "$binary" "${args[@]}"

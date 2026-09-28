@@ -101,6 +101,11 @@ on_exit() {
   rc=$?
   printf '%s\n' "$rc" > "${request_dir}/exit_code"
   date '+%Y-%m-%dT%H:%M:%S%z' > "${request_dir}/finished_at"
+  if [[ "${SCNET_KEEP_REQUEST_INPUTS:-0}" != "1" ]]; then
+    rm -f \
+      "$prompt_file" "$system_file" "$tokens_file" \
+      "$binary_file" "$model_file"
+  fi
 }
 trap on_exit EXIT
 

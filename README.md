@@ -1,7 +1,8 @@
 # scnet-aichat
 
-一个纯 Bash 的 SCNet/Slurm AI 问答面板。默认每个问题提交一个 Slurm 推理作业；
-另外提供持久 `llama-server` 模式，用于连续问答。
+一个 SCNet/Slurm AI 问答面板。支持 SSH 和 SCNet OpenAPI 两种 backend；
+默认每个问题提交一个 Slurm 推理作业，SSH backend 另外提供持久
+`llama-server` 模式。
 
 项目不在登录节点运行模型，也不包含模型、SSH 私钥、访问令牌、作业日志或个人路径。
 
@@ -11,6 +12,9 @@
 - Ubuntu
 - Debian
 - 其他提供 Bash、OpenSSH、`awk`、`mktemp` 的 Unix-like 系统
+
+SSH backend 不需要 Python；OpenAPI backend 和持久模式的 JSON 编码需要 Python 3
+（持久模式也可使用 Perl）。
 
 远端目标环境是 Slurm + Hygon DCU/DTK + llama.cpp HIP，内置 14B 单卡和 32B 四卡资源模板。
 
@@ -22,23 +26,51 @@
 
 ### Agent 一句话安装
 
-仓库是私有的，因此执行前需要本机已经配置 GitHub SSH key，或已经运行
-`gh auth login`。Agent 可直接执行下面的一句话：
-
 ```bash
-bash -lc 'set -eu; d="${SCNET_AICHAT_DIR:-$HOME/.local/src/scnet-aichat}"; if [ -d "$d/.git" ]; then git -C "$d" pull --ff-only; else mkdir -p "$(dirname "$d")"; git clone git@github.com:lql341/scnet-aichat.git "$d"; fi; "$d/install.sh" --check --remote-install'
+bash -lc 'set -eu; d="${SCNET_AICHAT_DIR:-$HOME/.local/src/scnet-aichat}"; if [ -d "$d/.git" ]; then git -C "$d" pull --ff-only; else mkdir -p "$(dirname "$d")"; git clone https://github.com/lql341/scnet-aichat.git "$d"; fi; "$d/install.sh" --check'
 ```
 
-该命令会安装本地客户端、初始化配置（只在配置不存在时创建）、上传远端 worker，
-并运行本地和远端检查；不会下载模型、覆盖已有配置或删除远端数据。
+该命令安装本地客户端、初始化非密钥配置并运行本地测试；不会连接 SCNet、下载模型、
+覆盖已有配置或删除远端数据。
 
-如果使用 GitHub CLI：
+### 1. 推荐：配置 OpenAPI
 
 ```bash
-bash -lc 'set -eu; d="${SCNET_AICHAT_DIR:-$HOME/.local/src/scnet-aichat}"; if [ -d "$d/.git" ]; then git -C "$d" pull --ff-only; else mkdir -p "$(dirname "$d")"; gh repo clone lql341/scnet-aichat "$d"; fi; "$d/install.sh" --check --remote-install'
+scnet-aichat setup new
+scnet-aichat --backend openapi doctor
+scnet-aichat --backend openapi ask "请解释张量并行。"
 ```
 
-### 1. 准备 SSH profile
+配置面板要求输入 SCNet 平台用户名、AccessKey 和 SecretKey。SecretKey 不回显。
+凭据存储规则与 `scnet-hpc` 兼容：
+
+- macOS：保存在 Keychain，service 为 `scnet-hpc-openapi`；
+- Linux：有 `secret-tool` 时保存在 Secret Service；
+- 没有安全凭据库：不写明文文件，只接受
+  `SCNET_OPENAPI_USER`、`SCNET_OPENAPI_ACCESS_KEY`、
+  `SCNET_OPENAPI_SECRET_KEY` 环境变量。
+
+每次调用都会用 AK/SK 获取临时区域 token；token 不落盘。区域、scheduler、区域用户名
+和 HOME 自动发现，非密钥 metadata 以 `0600` 保存到
+`~/.config/scnet-aichat/openapi.json`。
+
+首次 setup 会列出账号已授权的区域，并默认选中昆山；用户只选择区域名称，不输入或
+管理 Region ID。选择结果保存在本地私有 metadata 中。未来启用华中一区等其他区域时，
+运行 `scnet-aichat setup modify` 重新选择即可。
+
+配置生命周期：
+
+```bash
+scnet-aichat setup status
+scnet-aichat setup modify
+scnet-aichat setup reset               # 只删除本项目 metadata
+scnet-aichat setup reset-credentials   # 显式删除共享 AK/SK
+```
+
+OpenAPI 当前支持单次作业模式。持久 `llama-server` 依赖 allocation 内的 `srun`，
+暂时只支持 SSH backend。
+
+### 2. 可选：配置 SSH profile
 
 客户端只调用 SSH profile，不保存私钥。`~/.ssh/config` 的最小示例：
 
@@ -58,10 +90,10 @@ Host kseshell
 ssh kseshell 'hostname; echo "$HOME"'
 ```
 
-### 2. 获取项目并创建配置
+### 3. 手工获取项目和配置
 
 ```bash
-git clone git@github.com:lql341/scnet-aichat.git
+git clone https://github.com/lql341/scnet-aichat.git
 cd scnet-aichat
 
 mkdir -p ~/.config/scnet-aichat
@@ -81,25 +113,24 @@ ${EDITOR:-vi} ~/.config/scnet-aichat/config
 ./tests/test.sh
 mkdir -p ~/.local/bin ~/.local/share/scnet-aichat
 cp scnet-aichat ~/.local/bin/scnet-aichat
-cp -R worker server config.example ~/.local/share/scnet-aichat/
+cp -R worker server scripts config.example ~/.local/share/scnet-aichat/
 chmod 755 ~/.local/bin/scnet-aichat
 ```
 
 然后把 `~/.local/bin` 加入 `PATH`，创建并编辑
-`~/.config/scnet-aichat/config`，最后执行 `scnet-aichat install` 和
-`scnet-aichat doctor`。
+`~/.config/scnet-aichat/config`。选择 OpenAPI 时先运行
+`scnet-aichat setup new`；选择 SSH 时确保 SSH profile 已配置。
 
-### 3. 安装远端 worker 并检查
+### 4. 安装远端 worker 并检查
 
 ```bash
 ./scnet-aichat install
 ./scnet-aichat doctor
 ```
 
-`install` 只上传一个 Slurm worker 到远端 `~/.scnet-aichat/worker.slurm`；
-不会上传 GGUF，也不会覆盖模型。
+`install` 通过当前 backend 上传 Slurm worker；不会上传 GGUF，也不会覆盖模型。
 
-### 4. 打开面板
+### 5. 打开面板
 
 ```bash
 ./scnet-aichat
@@ -108,6 +139,8 @@ chmod 755 ~/.local/bin/scnet-aichat
 直接输入问题即可提交作业。面板命令：
 
 ```text
+/backend ssh
+/backend openapi
 /model 14b
 /model 32b
 /mode job
@@ -134,6 +167,7 @@ chmod 755 ~/.local/bin/scnet-aichat
 
 ```bash
 ./scnet-aichat ask "请解释张量并行。"
+./scnet-aichat --backend openapi ask "请解释张量并行。"
 ./scnet-aichat --model 32b --max-tokens 256 ask "写一个简短示例。"
 ./scnet-aichat --mode server --model 14b ask "连续问答的第一问。"
 ./scnet-aichat --mode server --model 14b --preset eva-rp ask "开始角色扮演。"
@@ -234,7 +268,11 @@ chmod 755 ~/.local/bin/scnet-aichat
 也可以通过 `SCNET_AICHAT_CONFIG` 指定其他文件。所有选项见
 [`config.example`](config.example)。
 
-如果未设置 `SCNET_REMOTE_HOME`，客户端会通过 SSH 自动读取远端 `$HOME`，再推导：
+配置文件使用受限的 `SCNET_*=value` 解析器，不会作为 Shell 脚本执行；包含
+`ACCESS_KEY`、`SECRET_KEY`、`API_KEY`、`TOKEN` 或 `PASSWORD` 的键会被拒绝。
+
+如果未设置 `SCNET_REMOTE_HOME`，SSH backend 会通过 SSH 读取远端 `$HOME`；
+OpenAPI backend 会从区域中心信息发现 HOME。随后推导：
 
 - 远端应用目录：`$HOME/.scnet-aichat`
 - llama.cpp：`$HOME/eva-k100/llama.cpp-b5046/build-gfx906/bin/llama-cli`
@@ -265,6 +303,9 @@ chmod 755 ~/.local/bin/scnet-aichat
 
 频繁问答推荐保持一个 Slurm 作业运行，让 `llama-server` 只加载一次模型。脚本位于
 [`server/llama-server.slurm`](server/llama-server.slurm)。
+
+持久模式当前要求 `--backend ssh`。服务默认只监听计算节点的
+`127.0.0.1`，客户端通过 allocation 内的 `srun` 调用。
 
 ### 1. 编译 server
 
@@ -299,7 +340,7 @@ ssh kseshell '
   sbatch \
     --output=$HOME/.scnet-aichat/server/slurm-%j.out \
     --error=$HOME/.scnet-aichat/server/slurm-%j.err \
-    --export=ALL,SCNET_SERVER_APP_DIR=$HOME/.scnet-aichat \
+    --export=SCNET_SERVER_APP_DIR=$HOME/.scnet-aichat \
     $HOME/.scnet-aichat/server/llama-server.slurm
 '
 ```
@@ -345,7 +386,8 @@ SCNet Dockerfile 构建要求 `COPY`/`ADD` 的文件放到用户家目录 `docke
 ```bash
 mkdir -p ~/dockerFileTemp
 scp /path/to/llama-server kseshell:~/dockerFileTemp/llama-server
-scp server/start-server.sh kseshell:~/dockerFileTemp/start-server.sh
+ssh kseshell 'mkdir -p ~/dockerFileTemp/server'
+scp server/start-server.sh kseshell:~/dockerFileTemp/server/start-server.sh
 scp Dockerfile kseshell:~/dockerFileTemp/Dockerfile
 ```
 
@@ -356,7 +398,7 @@ scp Dockerfile kseshell:~/dockerFileTemp/Dockerfile
 - 服务端口 `8080`；
 - GGUF 通过持久存储挂载到 `/models`；
 - `SCNET_MODEL_PATH` 指向挂载后的 GGUF；
-- 需要鉴权时给 server 启动参数增加 `--api-key`。
+- 必须通过安全环境注入设置 `SCNET_SERVER_API_KEY`。
 
 不要把 GGUF 权重提交到 Git 或 Docker build context。计算节点不能联网时，应在 SCNet
 镜像构建服务或可联网的构建环境完成构建；容器运行时只使用已打包依赖、挂载模型和
@@ -382,12 +424,20 @@ make test
 SCNET_AICHAT_REMOTE_TESTS=1 ./tests/test.sh
 ```
 
-测试覆盖 Bash 语法、Bash 3.2 兼容性、14B/32B 资源映射、非法参数拒绝，以及可选的
-远端 worker、模型和分区检查。
+测试覆盖 Bash/Python 语法、OpenAPI 签名和发现、凭据与路径脱敏、安装布局、
+Bash 3.2 兼容性、14B/32B 资源映射、非法参数拒绝，以及可选的远端检查。
+
+2026-09-28 已在昆山区域完成 OpenAPI 端到端 smoke：请求文件上传、14B Slurm
+提交、状态轮询、模型推理、回答及性能日志下载均成功。
 
 ## 安全
 
-- 不要把 SSH 私钥、GitHub token 或集群凭据写入配置文件。
+- AK/SK 只进入 Keychain、Secret Service 或当前进程环境，不写普通配置文件。
+- OpenAPI 区域 token 每次运行重新获取，不持久化。
+- 个人 HOME 和模型绝对路径不会出现在 `--dry-run` 或历史列表中。
 - `config`、`.env`、日志和结果目录默认不会被 Git 跟踪。
+- worker 默认在作业结束时删除 prompt、system prompt 和运行路径输入文件；回答及
+  Slurm 日志仍保留在远端请求目录，用户应按所在站点的数据保留策略清理。
+- Slurm 持久服务只监听回环地址；容器服务强制要求 API key。
 - 客户端会校验模型、资源数字、远端路径和作业号。
 - `cancel` 只在用户显式执行时调用 `scancel`。

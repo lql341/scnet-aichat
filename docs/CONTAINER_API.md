@@ -51,23 +51,12 @@ discovery layer. Do not hardcode a token or assume every region uses the same ho
 Do not create and delete an instance for every prompt; deployment and model-loading
 latency defeats the API-like experience.
 
-## Current validation status
+## Validation boundary
 
-Validated read-only operations:
+Account-specific authorization results, resource-group names, mount paths, instance IDs,
+and service URLs must remain in local mode-0600 metadata or runtime memory. They must not
+be copied into repository documents or generated public reports.
 
-- region/token authentication;
-- resource groups;
-- authorized mount paths;
-- private/public image listing;
-- container listing;
-- container detail/URL endpoints.
-
-Validated lifecycle operation:
-
-- a previously terminated 1-DCU test instance accepted restart;
-- it remained `Waiting` for approximately 270 seconds;
-- it was stopped afterward and returned to `Terminated`.
-
-No new instance was created and no container was left running. Before enabling this
-backend in the client, confirm that the account has a nonzero DCU container limit and
-that the desired resource group can schedule a 14B service.
+Before enabling this backend in the client, query the authenticated account for its
+container limit and confirm that the selected resource group can schedule the requested
+14B or 32B service.

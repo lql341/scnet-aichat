@@ -13,7 +13,7 @@ ssh kseshell '
   sbatch \
     --output=$HOME/.scnet-aichat/server/slurm-%j.out \
     --error=$HOME/.scnet-aichat/server/slurm-%j.err \
-    --export=ALL,SCNET_SERVER_APP_DIR=$HOME/.scnet-aichat \
+    --export=SCNET_SERVER_APP_DIR=$HOME/.scnet-aichat \
     $HOME/.scnet-aichat/server/llama-server.slurm
 '
 ```
@@ -46,6 +46,9 @@ This avoids opening a compute-node port to the login network. A production clien
 wrap these `srun --jobid ... --overlap curl` calls, or use an SSH tunnel if the site
 permits direct access to the allocated node.
 
+The Slurm server binds to `127.0.0.1`; it is not exposed on the compute-node network.
+Container mode is separate and requires `SCNET_SERVER_API_KEY`.
+
 ## Trade-off
 
 Persistent mode pays the model load once and is preferable for many questions in one
@@ -53,7 +56,8 @@ session. It consumes the requested DCU/CPU allocation continuously until cancell
 until the walltime expires:
 
 ```bash
-ssh kseshell "scancel $(cat ~/.scnet-aichat/server/job_id)"
+JOB_ID="$(ssh kseshell 'cat ~/.scnet-aichat/server/job_id')"
+ssh kseshell "scancel '$JOB_ID'"
 ```
 
 The existing `scnet-aichat` command remains the safer default for occasional questions:

@@ -1,6 +1,15 @@
 .DS_Store
 .env
+.env.*
 config
+*.key
+*.pem
+id_rsa*
+id_ed25519*
+*.gguf
+llama-server
+__pycache__/
+*.pyc
 *.log
 *.out
 *.err

@@ -5,12 +5,12 @@ desktop, coding agent, or operator.
 
 ## What the project does
 
-`scnet-aichat` is a local Bash client. It never runs EVA on the local computer.
-It uploads prompts over SSH and runs the model on SCNet:
+`scnet-aichat` is a local client. It never runs EVA on the local computer.
+It uploads prompts through SSH or SCNet OpenAPI and runs the model on SCNet:
 
 ```text
-local Bash client
-  -> SSH login node
+local client
+  -> SSH or OpenAPI
   -> Slurm job in kshdnormal
   -> llama.cpp HIP on Z100/gfx906
   -> EVA GGUF model
@@ -20,7 +20,8 @@ There are two modes:
 
 - `job`: one Slurm job per question; resources are released after completion.
 - `server`: one long-lived Slurm allocation with `llama-server`; later requests reuse
-  the loaded model. Stop it explicitly or it consumes resources until walltime expires.
+  the loaded model. This mode currently requires SSH. Stop it explicitly or it consumes
+  resources until walltime expires.
 
 ## New-machine prerequisites
 
@@ -29,27 +30,30 @@ There are two modes:
 Required:
 
 - Bash 3.2 or newer;
-- OpenSSH: `ssh`, `scp`;
 - standard commands: `awk`, `mktemp`, `install`, `cp`;
-- Git or GitHub CLI for a private-repository clone.
+- Git;
+- Python 3 for OpenAPI.
+
+SSH backend additionally requires OpenSSH: `ssh`, `scp`.
 
 Not required locally:
 
-- Python;
 - PyTorch;
 - ROCm/DTK;
 - Docker;
 - GPU;
 - model files.
 
-### GitHub access
+### OpenAPI access
 
-The repository is private. Choose one:
+Run `scnet-aichat setup new` and enter the SCNet platform username, AccessKey and
+SecretKey. Credentials are stored in macOS Keychain or Linux Secret Service using the
+`scnet-hpc-openapi` service. Without a supported credential store, inject
+`SCNET_OPENAPI_USER`, `SCNET_OPENAPI_ACCESS_KEY`, and
+`SCNET_OPENAPI_SECRET_KEY` through the environment.
 
-- SSH: `git@github.com:lql341/scnet-aichat.git` and a GitHub SSH key;
-- GitHub CLI: `gh auth login` with repository read access.
-
-Do not put a GitHub token in the project config.
+Do not put AK, SK, token, SSH private keys, or user-specific paths in the repository
+configuration.
 
 ### SCNet SSH access
 
@@ -93,39 +97,33 @@ If paths or module names differ, set them in
 
 ## Agent one-liner installation
 
-This is the recommended handoff command when the agent already has GitHub SSH access
-and the SCNet SSH profile configured. It is idempotent for an existing checkout:
+This command installs and tests the local client without contacting SCNet:
 
 ```bash
-bash -lc 'set -eu; d="${SCNET_AICHAT_DIR:-$HOME/.local/src/scnet-aichat}"; if [ -d "$d/.git" ]; then git -C "$d" pull --ff-only; else mkdir -p "$(dirname "$d")"; git clone git@github.com:lql341/scnet-aichat.git "$d"; fi; "$d/install.sh" --check --remote-install'
-```
-
-If using GitHub CLI instead of an SSH Git remote:
-
-```bash
-bash -lc 'set -eu; d="${SCNET_AICHAT_DIR:-$HOME/.local/src/scnet-aichat}"; if [ -d "$d/.git" ]; then git -C "$d" pull --ff-only; else mkdir -p "$(dirname "$d")"; gh repo clone lql341/scnet-aichat "$d"; fi; "$d/install.sh" --check --remote-install'
+bash -lc 'set -eu; d="${SCNET_AICHAT_DIR:-$HOME/.local/src/scnet-aichat}"; if [ -d "$d/.git" ]; then git -C "$d" pull --ff-only; else mkdir -p "$(dirname "$d")"; git clone https://github.com/lql341/scnet-aichat.git "$d"; fi; "$d/install.sh" --check'
 ```
 
 The one-liner:
 
-1. clones or fast-forwards the private repository;
+1. clones or fast-forwards the public repository;
 2. installs the local command into `~/.local/bin`;
 3. creates `~/.config/scnet-aichat/config` only if it does not exist;
-4. uploads the worker and persistent-server Slurm script;
-5. runs local tests and remote `doctor`.
+4. installs the OpenAPI helper;
+5. runs local tests.
 
-It does not download models, overwrite an existing config, cancel jobs, or delete files.
+It does not connect to SCNet, download models, overwrite an existing config, cancel jobs,
+or delete remote files.
 
 ## Manual installation
 
 ```bash
-git clone git@github.com:lql341/scnet-aichat.git
+git clone https://github.com/lql341/scnet-aichat.git
 cd scnet-aichat
 ./install.sh --check
 mkdir -p ~/.config/scnet-aichat
 cp config.example ~/.config/scnet-aichat/config
 ${EDITOR:-vi} ~/.config/scnet-aichat/config
-./install.sh --remote-install --no-init-config
+./install.sh --no-init-config
 ```
 
 If `~/.local/bin` is not on `PATH`:
@@ -137,7 +135,8 @@ export PATH="$HOME/.local/bin:$PATH"
 Then:
 
 ```bash
-scnet-aichat doctor
+scnet-aichat setup new
+scnet-aichat --backend openapi doctor
 scnet-aichat
 ```
 
@@ -147,6 +146,7 @@ Occasional questions:
 
 ```bash
 scnet-aichat ask "请解释张量并行。"
+scnet-aichat --backend openapi ask "请解释张量并行。"
 ```
 
 Persistent server:
@@ -156,6 +156,9 @@ Persistent server:
 /serve status
 /serve stop
 ```
+
+Persistent mode is SSH-only. OpenAPI supports one-shot jobs, status, results, and
+cancellation.
 
 EVA roleplay preset:
 
@@ -196,6 +199,8 @@ git -C "$HOME/.local/src/scnet-aichat" checkout <known-good-commit>
 ## Troubleshooting
 
 - `Permission denied (publickey)`: fix the SSH profile/key before running the client.
+- `OpenAPI credentials are not configured`: run `scnet-aichat setup new` or inject the
+  three `SCNET_OPENAPI_*` credential variables.
 - `worker=missing`: run `scnet-aichat install`.
 - `llama_cli=missing`: set `SCNET_LLAMA_CLI` or build llama.cpp on the remote account.
 - `model_14b`/`model_32b` missing: set model paths or stage the GGUF files.
@@ -207,6 +212,8 @@ git -C "$HOME/.local/src/scnet-aichat" checkout <known-good-commit>
 
 ## Security and data boundaries
 
-Local secrets belong in the SSH agent/keychain, not in Git. The repository intentionally
-does not contain model files, SSH keys, access tokens, private API credentials, job logs,
-or user-specific remote paths.
+Local secrets belong in the SSH agent, Keychain, or Secret Service, not in Git. OpenAPI
+tokens are ephemeral. User-specific HOME/model paths are discovered locally and redacted
+from dry-run/history output. The worker removes prompt/system/runtime input files after
+the job; answers and Slurm logs remain in the private remote request directory until the
+user removes them.

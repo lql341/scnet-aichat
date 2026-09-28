@@ -16,18 +16,21 @@ ENV TZ=Asia/Shanghai
 SHELL ["/bin/bash", "-c"]
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates openssh-server sudo curl && \
+    apt-get install -y --no-install-recommends ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /opt/scnet-aichat/bin /var/run/sshd /root/.ssh
+RUN useradd --system --uid 10001 --create-home --home-dir /home/scnet-aichat scnet-aichat && \
+    mkdir -p /opt/scnet-aichat/bin && \
+    chown -R scnet-aichat:scnet-aichat /opt/scnet-aichat
 COPY llama-server /opt/scnet-aichat/bin/llama-server
-COPY start-server.sh /opt/scnet-aichat/start-server.sh
+COPY server/start-server.sh /opt/scnet-aichat/start-server.sh
 RUN chmod 755 /opt/scnet-aichat/bin/llama-server /opt/scnet-aichat/start-server.sh && \
-    ssh-keygen -A
+    chown -R scnet-aichat:scnet-aichat /opt/scnet-aichat
 
 ENV SCNET_LLAMA_SERVER=/opt/scnet-aichat/bin/llama-server
 ENV SCNET_MODEL_PATH=/models/EVA-Qwen2.5-14B-v0.2-Q4_0.gguf
 ENV SCNET_PORT=8080
 
+USER scnet-aichat
 EXPOSE 8080
 CMD ["/opt/scnet-aichat/start-server.sh"]

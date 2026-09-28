@@ -5,6 +5,7 @@ set -euo pipefail
 : "${SCNET_LLAMA_SERVER:=/opt/scnet-aichat/bin/llama-server}"
 : "${SCNET_MODEL_PATH:=/models/EVA-Qwen2.5-14B-v0.2-Q4_0.gguf}"
 : "${SCNET_PORT:=8080}"
+: "${SCNET_SERVER_API_KEY:?SCNET_SERVER_API_KEY is required for container mode}"
 
 exec "$SCNET_LLAMA_SERVER" \
   --model "$SCNET_MODEL_PATH" \
@@ -16,4 +17,4 @@ exec "$SCNET_LLAMA_SERVER" \
   --parallel "${SCNET_PARALLEL:-1}" \
   --gpu-layers 99 \
   --jinja \
-  --metrics
+  --api-key "$SCNET_SERVER_API_KEY"

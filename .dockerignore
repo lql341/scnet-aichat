@@ -1,0 +1,16 @@
+.git
+.github
+.DS_Store
+.env
+.env.*
+config
+results
+.tmp
+*.log
+*.out
+*.err
+*.gguf
+id_rsa*
+id_ed25519*
+*.key
+*.pem
