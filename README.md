@@ -24,14 +24,14 @@ SSH backend 不需要 Python；OpenAPI backend 和持久模式的 JSON 编码需
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)，容器 API 说明见
 [`docs/CONTAINER_API.md`](docs/CONTAINER_API.md)。
 
-### Agent 一句话安装
+### Agent 安装指令
 
-```bash
-bash -lc 'set -eu; d="${SCNET_AICHAT_DIR:-$HOME/.local/src/scnet-aichat}"; if [ -d "$d/.git" ]; then git -C "$d" pull --ff-only; else mkdir -p "$(dirname "$d")"; git clone https://github.com/lql341/scnet-aichat.git "$d"; fi; "$d/install.sh" --check'
-```
+> 请从 GitHub 仓库 `lql341/scnet-aichat` 安装或更新到
+> `~/.local/src/scnet-aichat`：如果目录已存在则执行 fast-forward 更新，否则使用
+> HTTPS clone；然后运行 `install.sh --check` 安装本地客户端并执行测试。不要连接
+> SCNet、提交作业、下载模型、覆盖已有配置或删除远端数据。完成后报告安装路径和测试结果。
 
-该命令安装本地客户端、初始化非密钥配置并运行本地测试；不会连接 SCNet、下载模型、
-覆盖已有配置或删除远端数据。
+该指令只安装本地客户端、初始化非密钥配置并运行本地测试。
 
 ### 1. 推荐：配置 OpenAPI
 
@@ -70,7 +70,7 @@ scnet-aichat setup reset-credentials   # 显式删除共享 AK/SK
 OpenAPI 当前支持单次作业模式。持久 `llama-server` 依赖 allocation 内的 `srun`，
 暂时只支持 SSH backend。
 
-### 2. 可选：配置 SSH profile
+### 2. 配置 SSH profile（可选）
 
 客户端只调用 SSH profile，不保存私钥。`~/.ssh/config` 的最小示例：
 

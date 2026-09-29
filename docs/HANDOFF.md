@@ -95,15 +95,17 @@ The worker uses:
 If paths or module names differ, set them in
 `~/.config/scnet-aichat/config`.
 
-## Agent one-liner installation
+## Agent installation instruction
 
-This command installs and tests the local client without contacting SCNet:
+Give your coding agent this natural-language instruction:
 
-```bash
-bash -lc 'set -eu; d="${SCNET_AICHAT_DIR:-$HOME/.local/src/scnet-aichat}"; if [ -d "$d/.git" ]; then git -C "$d" pull --ff-only; else mkdir -p "$(dirname "$d")"; git clone https://github.com/lql341/scnet-aichat.git "$d"; fi; "$d/install.sh" --check'
-```
+> Please install or update the public GitHub repository `lql341/scnet-aichat` at
+> `~/.local/src/scnet-aichat`. If the directory already exists, fast-forward it; otherwise
+> clone it over HTTPS. Then run `install.sh --check` to install the local client and execute
+> the tests. Do not connect to SCNet, submit jobs, download models, overwrite existing
+> configuration, or delete remote data. Report the installation path and test result.
 
-The one-liner:
+The instruction:
 
 1. clones or fast-forwards the public repository;
 2. installs the local command into `~/.local/bin`;
